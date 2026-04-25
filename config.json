@@ -1,0 +1,13 @@
+{
+  "DISCORD_TOKEN": "your discord bot token",
+  "LLM_BACKEND": "gemini",
+  "LLAMA_BASE_URL": "http://127.0.0.1:8080/v1",
+  "LLAMA_API_KEY": "sk-no-key-required",
+  "LLAMA_MODEL_ID": "default",
+  "GEMINI_API_KEY": "your gemini api key",
+  "GEMINI_MODEL_ID": "gemini-3.1-flash-lite-preview",
+  "MAX_TOKEN_LIMIT": 1000,
+  "DB_FILE": "history.db",
+  "MAX_DISCORD_MSG_LEN": 2000,
+  "API_COOLDOWN_SECONDS": 1.0
+}

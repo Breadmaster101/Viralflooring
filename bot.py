@@ -17,26 +17,33 @@ logging.basicConfig(
     handlers=[logging.FileHandler("bot.log", encoding="utf-8"), logging.StreamHandler()]
 )
 
-# config
-DISCORD_TOKEN = "your discord bot token"
+# load config
+try:
+    with open("config.json", "r", encoding="utf-8") as f:
+        config = json.load(f)
+except FileNotFoundError:
+    logging.critical("config.json not found! Please create it.")
+    exit()
+
+DISCORD_TOKEN = config.get("DISCORD_TOKEN", "your discord bot token")
 
 # backend selection ('local' or 'gemini')
-LLM_BACKEND = "gemini"
+LLM_BACKEND = config.get("LLM_BACKEND", "gemini")
 
 # local backend settings
-LLAMA_BASE_URL = "http://127.0.0.1:8080/v1"
-LLAMA_API_KEY  = "sk-no-key-required"
-LLAMA_MODEL_ID = "default"
+LLAMA_BASE_URL = config.get("LLAMA_BASE_URL", "http://127.0.0.1:8080/v1")
+LLAMA_API_KEY  = config.get("LLAMA_API_KEY", "sk-no-key-required")
+LLAMA_MODEL_ID = config.get("LLAMA_MODEL_ID", "default")
 
 # gemini backend settings
-GEMINI_API_KEY  = "your gemini api key"
-GEMINI_MODEL_ID = "gemini-3.1-flash-lite-preview"
+GEMINI_API_KEY  = config.get("GEMINI_API_KEY", "your gemini api key")
+GEMINI_MODEL_ID = config.get("GEMINI_MODEL_ID", "gemini-3.1-flash-lite-preview")
 
 # shared settings
-MAX_TOKEN_LIMIT       = 1000
-DB_FILE               = "history.db"
-MAX_DISCORD_MSG_LEN   = 2000
-API_COOLDOWN_SECONDS  = 1.0
+MAX_TOKEN_LIMIT       = config.get("MAX_TOKEN_LIMIT", 1000)
+DB_FILE               = config.get("DB_FILE", "history.db")
+MAX_DISCORD_MSG_LEN   = config.get("MAX_DISCORD_MSG_LEN", 2000)
+API_COOLDOWN_SECONDS  = config.get("API_COOLDOWN_SECONDS", 1.0)
 
 # resolve config
 if LLM_BACKEND == "gemini":

@@ -18,7 +18,7 @@ An autonomous Discord bot that uses either local models (via llama.cpp) or the G
 ## Setup
 1. Clone the repository.
 2. Install dependencies: `pip install discord.py openai aiosqlite tiktoken`
-3. Configure the bot by editing the config section in `bot.py`:
+3. Configure the bot by editing `config.json`:
    - Set `DISCORD_TOKEN` to your Discord bot token.
    - Choose your `LLM_BACKEND` (`"local"` or `"gemini"`).
    - If using Gemini, set your `GEMINI_API_KEY`.
