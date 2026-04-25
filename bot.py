@@ -250,6 +250,7 @@ class LlamaDiscordBot(discord.Client):
 
         try:
             triage_response = await self.call_llama_api(payload)
+            triage_response = re.sub(r'<(thought|think)>.*?</\1>\s*', '', triage_response, flags=re.DOTALL)
             json_match = re.search(r'\{.*\}', triage_response, re.DOTALL)
             if json_match:
                 data = json.loads(json_match.group(0))
@@ -279,6 +280,9 @@ class LlamaDiscordBot(discord.Client):
 
                 response_text = await self.call_llama_api(payload)
                 response_text = response_text.replace('\u200b', '')
+                
+                # strip out thought blocks
+                response_text = re.sub(r'<(thought|think)>.*?</\1>\s*', '', response_text, flags=re.DOTALL)
 
                 # easter egg check
                 user_message_lower = target.clean_content.lower() if explicit else (sanitized_history[-1]['content'].lower() if sanitized_history else "")

@@ -5,7 +5,7 @@
   "LLAMA_API_KEY": "sk-no-key-required",
   "LLAMA_MODEL_ID": "default",
   "GEMINI_API_KEY": "your gemini api key",
-  "GEMINI_MODEL_ID": "gemini-3.1-flash-lite-preview",
+  "GEMINI_MODEL_ID": "gemma-4-31b-it",
   "MAX_TOKEN_LIMIT": 1000,
   "DB_FILE": "history.db",
   "MAX_DISCORD_MSG_LEN": 2000,
