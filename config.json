@@ -5,7 +5,7 @@
   "LLAMA_API_KEY": "sk-no-key-required",
   "LLAMA_MODEL_ID": "default",
   "GEMINI_API_KEY": "your gemini api key",
-  "GEMINI_MODEL_ID": "gemma-4-26b-a4b-it",
+  "GEMINI_MODEL_ID": "gemma-4-31b-it",
   "TRIAGE_GEMINI_MODEL_ID": "gemma-4-26b-a4b-it",
   "DISABLE_GEMINI_THINKING": true,
   "DISABLE_TRIAGE_GEMINI_THINKING": true,
