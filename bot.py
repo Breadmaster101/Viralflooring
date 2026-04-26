@@ -39,11 +39,21 @@ LLAMA_MODEL_ID = config.get("LLAMA_MODEL_ID", "default")
 GEMINI_API_KEY  = config.get("GEMINI_API_KEY", "your gemini api key")
 GEMINI_MODEL_ID = config.get("GEMINI_MODEL_ID", "gemini-3.1-flash-lite-preview")
 
+# triage backend settings
+TRIAGE_LLM_BACKEND = config.get("TRIAGE_LLM_BACKEND", LLM_BACKEND)
+TRIAGE_LLAMA_BASE_URL = config.get("TRIAGE_LLAMA_BASE_URL", LLAMA_BASE_URL)
+TRIAGE_LLAMA_API_KEY  = config.get("TRIAGE_LLAMA_API_KEY", LLAMA_API_KEY)
+TRIAGE_LLAMA_MODEL_ID = config.get("TRIAGE_LLAMA_MODEL_ID", LLAMA_MODEL_ID)
+TRIAGE_GEMINI_API_KEY  = config.get("TRIAGE_GEMINI_API_KEY", GEMINI_API_KEY)
+TRIAGE_GEMINI_MODEL_ID = config.get("TRIAGE_GEMINI_MODEL_ID", GEMINI_MODEL_ID)
+
 # shared settings
 MAX_TOKEN_LIMIT       = config.get("MAX_TOKEN_LIMIT", 1000)
 DB_FILE               = config.get("DB_FILE", "history.db")
 MAX_DISCORD_MSG_LEN   = config.get("MAX_DISCORD_MSG_LEN", 2000)
 API_COOLDOWN_SECONDS  = config.get("API_COOLDOWN_SECONDS", 1.0)
+DISABLE_GEMINI_THINKING = config.get("DISABLE_GEMINI_THINKING", False)
+DISABLE_TRIAGE_GEMINI_THINKING = config.get("DISABLE_TRIAGE_GEMINI_THINKING", False)
 
 # resolve config
 if LLM_BACKEND == "gemini":
@@ -56,6 +66,18 @@ elif LLM_BACKEND == "local":
     _MODEL_ID     = LLAMA_MODEL_ID
 else:
     raise ValueError(f"Unknown LLM_BACKEND value: '{LLM_BACKEND}'. Must be 'local' or 'gemini'.")
+
+# resolve triage config
+if TRIAGE_LLM_BACKEND == "gemini":
+    _TRIAGE_API_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+    _TRIAGE_API_KEY      = TRIAGE_GEMINI_API_KEY
+    _TRIAGE_MODEL_ID     = TRIAGE_GEMINI_MODEL_ID
+elif TRIAGE_LLM_BACKEND == "local":
+    _TRIAGE_API_BASE_URL = TRIAGE_LLAMA_BASE_URL
+    _TRIAGE_API_KEY      = TRIAGE_LLAMA_API_KEY
+    _TRIAGE_MODEL_ID     = TRIAGE_LLAMA_MODEL_ID
+else:
+    raise ValueError(f"Unknown TRIAGE_LLM_BACKEND value: '{TRIAGE_LLM_BACKEND}'. Must be 'local' or 'gemini'.")
 
 
 # api lock class
@@ -96,12 +118,22 @@ class LlamaDiscordBot(discord.Client):
             exit()
 
         try:
+            self.triage_openai_client = openai.AsyncOpenAI(
+                base_url=_TRIAGE_API_BASE_URL,
+                api_key=_TRIAGE_API_KEY,
+            )
+        except Exception as e:
+            logging.critical(f"Error configuring Triage OpenAI client: {e}")
+            exit()
+
+        try:
             self.tokenizer = tiktoken.get_encoding("cl100k_base")
         except Exception as e:
             logging.critical(f"Failed to load tokenizer: {e}")
             exit()
 
         logging.info(f"LLM backend: {LLM_BACKEND.upper()} | Model: {_MODEL_ID}")
+        logging.info(f"Triage backend: {TRIAGE_LLM_BACKEND.upper()} | Model: {_TRIAGE_MODEL_ID}")
 
     async def setup_hook(self):
         await self.init_db()
@@ -207,17 +239,35 @@ class LlamaDiscordBot(discord.Client):
         if text: chunks.append(text)
         return chunks
 
-    async def call_llama_api(self, conversation_messages):
+    async def call_llama_api(self, conversation_messages, is_triage=False):
         async with self.api_monitor.lock:
             elapsed = time.time() - self.api_monitor.last_call_time
             if elapsed < self.api_monitor.cooldown:
                 await asyncio.sleep(self.api_monitor.cooldown - elapsed)
             try:
-                completion = await self.openai_client.chat.completions.create(
-                    model=_MODEL_ID,
-                    messages=conversation_messages,
-                    max_tokens=1000,
-                )
+                client = self.triage_openai_client if is_triage else self.openai_client
+                model = _TRIAGE_MODEL_ID if is_triage else _MODEL_ID
+                
+                kwargs = {
+                    "model": model,
+                    "messages": conversation_messages,
+                    "max_tokens": 1000,
+                }
+                
+                # Check if we should disable thinking
+                should_disable = DISABLE_TRIAGE_GEMINI_THINKING if is_triage else DISABLE_GEMINI_THINKING
+                is_gemini = (TRIAGE_LLM_BACKEND == "gemini") if is_triage else (LLM_BACKEND == "gemini")
+                
+                if should_disable and is_gemini:
+                    model_lower = model.lower()
+                    if "gemma" in model_lower:
+                        kwargs["extra_body"] = {"reasoning_effort": "minimal"}
+                    elif "2.5" in model_lower:
+                        kwargs["extra_body"] = {"reasoning_effort": "low" if "pro" in model_lower else "none"}
+                    else:
+                        kwargs["extra_body"] = {"reasoning_effort": "low" if "pro" in model_lower else "minimal"}
+
+                completion = await client.chat.completions.create(**kwargs)
                 self.api_monitor.last_call_time = time.time()
                 return completion.choices[0].message.content.strip()
             except Exception as e:
@@ -249,7 +299,7 @@ class LlamaDiscordBot(discord.Client):
         payload.extend(sanitized_history)
 
         try:
-            triage_response = await self.call_llama_api(payload)
+            triage_response = await self.call_llama_api(payload, is_triage=True)
             triage_response = re.sub(r'<(thought|think)>.*?</\1>\s*', '', triage_response, flags=re.DOTALL)
             json_match = re.search(r'\{.*\}', triage_response, re.DOTALL)
             if json_match:
@@ -286,7 +336,7 @@ class LlamaDiscordBot(discord.Client):
 
                 # easter egg check
                 user_message_lower = target.clean_content.lower() if explicit else (sanitized_history[-1]['content'].lower() if sanitized_history else "")
-                if any(k in user_message_lower for k in ['woke', 'liberal']):
+                if any(k in user_message_lower for k in ['woke', 'robot', 'liberal']):
                     response_text = response_text.rstrip() + " I hit the jack pot! $                  1"
 
                 await self.add_message_to_db(channel_id, 'assistant', response_text)
