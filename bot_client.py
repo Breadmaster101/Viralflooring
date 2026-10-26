@@ -1,527 +1,538 @@
-"""
-bot_client.py — The main Discord bot class.
+# The Discord client. Each incoming message runs one "turn": the model sees the
+# recent history and its tools, and decides whether to reply, react, or stay quiet.
 
-Imports configuration, database, LLM, and utility modules to keep this file
-focused on Discord event handling and bot logic.
-"""
+from __future__ import annotations
 
-import discord
 import asyncio
 import logging
 import time
-import re
-import json
-import sys
-import tiktoken
+from collections.abc import Callable
+from typing import Any
 
-from config import (
-    LLM_BACKEND,
-    MODEL_ID,
-    MAX_TOKEN_LIMIT, DB_FILE,
-    API_COOLDOWN_SECONDS, API_TIMEOUT_SECONDS,
-    MAX_MEMORIES, DISABLE_MEMORY_SYSTEM,
+import discord
+
+import tools as tool_module
+from config import Config
+from database import (
+    add_message, add_reaction, get_context, get_reactions, init_db, remove_reaction,
+    update_message,
 )
-from memory import format_memories_for_prompt, apply_memory_updates
-from database import init_db, add_message, get_context
-from llm import APIRateLimiter, create_clients, call_llm_api
+from llm import LLMClient
+from memory import MemoryStore
+from persona import PERSONA_PLACEHOLDER, PersonaStore
+from tools import TurnContext, select_tools
+from user_memory import UserMemoryStore
 from utils import (
-    safe_typing, split_message, get_sanitized_history,
-    TrollConsoleHandler, input_buffer, input_lock,
+    apply_easter_eggs, build_history, chat_participants, clock_line, safe_typing,
+    split_message,
 )
 
+log = logging.getLogger(__name__)
 
-class LlamaDiscordBot(discord.Client):
-    def __init__(self, troll_mode=False):
+# Used when no persona file is configured; deliberately characterless
+DEFAULT_PERSONA = "You are a participant in a Discord chat."
+
+
+class ViralBot(discord.Client):
+    def __init__(self, cfg: Config, troll_mode: bool = False):
         intents = discord.Intents.default()
-        intents.messages = True
         intents.message_content = True
-        super().__init__(intents=intents)
+        # Privileged: off by default, since asking without enabling it in the portal stops startup
+        intents.members = cfg.discord.member_intent
 
-        self.api_monitor = APIRateLimiter(cooldown=API_COOLDOWN_SECONDS)
-        self.db = None
+        super().__init__(
+            intents=intents,
+            # Stop a model typing "@everyone" from pinging the server
+            allowed_mentions=discord.AllowedMentions(
+                everyone=False, roles=False, users=True, replied_user=False
+            ),
+        )
+
+        self.cfg = cfg
         self.troll_mode = troll_mode
-        self.last_troll_channel = None
+        self.db: Any = None
+        self.llm = LLMClient(cfg.llm)
+        self.memory = MemoryStore(cfg.memory, cfg.root / "memories") if cfg.memory.enabled else None
+        # Per-person memory, only on when memory itself is
+        self.user_memory = (
+            UserMemoryStore(cfg.memory, cfg.root / "memories")
+            if cfg.memory.enabled and cfg.memory.users.enabled else None
+        )
 
-        # autonomous settings
-        self.AUTONOMOUS_THRESHOLD = 7  # score (1-10) to trigger speaking
+        self.persona = self._load_persona()
+        self.persona_store = self._build_persona_store()
+        self.tools = select_tools(
+            cfg.tools.enabled, cfg.memory.enabled,
+            persona_editable=self.persona_store is not None,
+            user_memory_enabled=cfg.memory.users.enabled,
+        )
+        self.tool_schemas = [tool.schema() for tool in self.tools.values()]
 
+        self.tokenizer = self._load_tokenizer()
+
+        self._channel_locks: dict[int, asyncio.Lock] = {}
+        self._turns: set[asyncio.Task] = set()
+        self.last_troll_channel: discord.abc.Messageable | None = None
+
+        log.info(
+            "Backend %s | model %s%s | tools: %s",
+            cfg.llm.backend, cfg.llm.model,
+            f" (falling back to {' then '.join(cfg.llm.fallback_models)})"
+            if cfg.llm.fallback_models else "",
+            ", ".join(self.tools) or "(none)",
+        )
+
+    # ------------------------------------------------------------------
+    #  Startup
+    # ------------------------------------------------------------------
+
+    def _read(self, filename: str) -> str:
+        if not filename:
+            return ""
+        path = self.cfg.path(filename)
         try:
-            with open("systemprompt.txt", "r", encoding="utf-8") as f:
-                self.bot_persona = f.read()
-        except FileNotFoundError:
-            logging.info("systemprompt.txt not found. Proceeding without a system prompt.")
-            self.bot_persona = None
+            return path.read_text(encoding="utf-8")
+        except OSError:
+            log.warning("%s could not be read.", path)
+            return ""
 
-        # LLM clients
-        self.openai_client = create_clients()
+    def _load_persona(self) -> str:
+        # The prompt as authored; a missing fixed file falls back to a generic persona
+        fixed = self._read(self.cfg.persona.fixed_file)
+        persona = self._read(self.cfg.persona.persona_file)
+        if not fixed:
+            log.warning(
+                "%s is missing or empty; running with a generic persona.",
+                self.cfg.persona.fixed_file,
+            )
+            return DEFAULT_PERSONA
+        # Matches PersonaStore.render() byte for byte
+        if PERSONA_PLACEHOLDER in fixed:
+            return fixed.replace(PERSONA_PLACEHOLDER, persona.rstrip()).rstrip()
+        return f"{fixed.rstrip()}\n\n{persona}".rstrip()
 
-        # Tokenizer
+    def _build_persona_store(self) -> PersonaStore | None:
+        # None when self-editing is off or the persona file has no editable sections
+        if not self.cfg.persona.self_edit_enabled:
+            return None
+
+        fixed = self._read(self.cfg.persona.fixed_file)
+        persona = self._read(self.cfg.persona.persona_file)
+        if not fixed:
+            log.warning("Self-editing is off: %s could not be read.",
+                        self.cfg.persona.fixed_file)
+            return None
+
+        store = PersonaStore(
+            self.cfg.persona, fixed, persona,
+            directory=self.cfg.root / "persona",
+            backup_directory=self.cfg.root / "persona_backups",
+        )
+        if not store.editable:
+            log.warning(
+                "[persona] self_edit_enabled is true, but %s has no editable "
+                "sections — it needs at least one '## TITLE' section whose body "
+                "is a bullet list or a table. Self-editing is off.",
+                self.cfg.persona.persona_file,
+            )
+            return None
+
+        log.info("Persona self-editing on (scope: %s).", self.cfg.persona.scope)
+        return store
+
+    def _load_tokenizer(self):
         try:
-            self.tokenizer = tiktoken.get_encoding("cl100k_base")
-        except Exception as e:
-            logging.critical(f"Failed to load tokenizer: {e}")
-            exit()
+            import tiktoken
+            return tiktoken.get_encoding("cl100k_base")
+        except Exception:
+            # Not fatal: a rough estimate is enough for the history window
+            log.warning("tiktoken unavailable; estimating token counts instead.", exc_info=True)
+            return None
 
-        self.channel_locks = {}
-
-        logging.info(f"LLM backend: {LLM_BACKEND.upper()} | Model: {MODEL_ID}")
-
-    # ------------------------------------------------------------------
-    #  Lifecycle
-    # ------------------------------------------------------------------
-
-    async def setup_hook(self):
-        self.db = await init_db(DB_FILE)
-        if self.troll_mode:
-            asyncio.create_task(self.troll_input_worker())
-
-    async def close(self):
-        if self.db:
-            await self.db.close()
-        await super().close()
-
-    # ------------------------------------------------------------------
-    #  Helpers
-    # ------------------------------------------------------------------
-
-    MEMORY_INSTRUCTIONS = (
-        "\n\nMEMORY SYSTEM: You have a persistent long term memory Your current memories are shown below. "
-        "To update your memory, you may OPTIONALLY end your message with a memory block on a new line:\n"
-        "[MEMORY:{\"add\":[\"thing to remember\"],\"remove\":[\"thing to forget\"]}]\n"
-        "- 'add': short bullet points to save (brief, lowercase, factual)\n"
-        "- 'remove': existing memories to delete (must match exactly)\n"
-        "You can use this memory system whenever you learn something new about a user "
-        "(like their real name, preferences, opinions, running jokes, or anything correlated to their username), "
-        "you can save it. It helps you act more human.\n"
-        "Add context and mention specifics in your memories so that you know what they mean in the future and when to use them.\n"
-        "Write your memories in full descriptive sentences to make it easier to contextualize when reading the memory in the future.\n"
-        "Don't just randomly save current bits of conversation such as \"user is mad\", only save things that would be actually useful in the **future**, not now.\n"
-        "Only save things that you would like to have in your long-term memory. Things that you would like to remember tomorrow or in weeks to come.\n"
-        "The memory block is invisible to users — they won't see it.\n"
-        f"Memory limit: {MAX_MEMORIES} items. If full, remove old ones to make room.\n"
-    )
-
-    def count_tokens(self, text):
+    def count_tokens(self, text: str) -> int:
         if not text:
             return 0
+        if self.tokenizer is None:
+            return max(1, len(str(text)) // 4)
         return len(self.tokenizer.encode(str(text)))
 
-    def _get_guild_id(self, channel):
-        """Extract the guild ID from a channel, or None for DMs."""
-        return getattr(getattr(channel, 'guild', None), 'id', None)
+    async def setup_hook(self) -> None:
+        self.db = await init_db(self.cfg.path(self.cfg.history.db_file))
+        if self.troll_mode:
+            from troll import troll_input_worker
+            self.loop.create_task(troll_input_worker(self))
 
-    def _process_memory_block(self, response_text, guild_id=None):
-        """Extract [MEMORY:{...}] from the response, apply updates, return cleaned text."""
-        if DISABLE_MEMORY_SYSTEM:
-            return response_text
-        memory_match = re.search(r'\[MEMORY:(\{.*?\})\]', response_text, re.DOTALL)
-        if memory_match:
-            try:
-                mem_data = json.loads(memory_match.group(1))
-                adds = mem_data.get('add', [])
-                removes = mem_data.get('remove', [])
-                if adds or removes:
-                    updated = apply_memory_updates(adds, removes, guild_id)
-                    logging.info(f"[Memory] Added: {adds}, Removed: {removes} | Total: {len(updated)}")
-            except json.JSONDecodeError as e:
-                logging.warning(f"[Memory] Failed to parse memory JSON: {e}")
-            # Strip the memory block from the visible response
-            response_text = response_text[:memory_match.start()].rstrip() + response_text[memory_match.end():].lstrip()
-            response_text = response_text.strip()
-        return response_text
+    async def close(self) -> None:
+        # Let in-flight turns unwind before closing the database
+        pending = list(self._turns)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        if self.db is not None:
+            await self.db.close()
+        await self.llm.aclose()
+        await super().close()
+
+    async def on_ready(self) -> None:
+        mode = "troll mode" if self.troll_mode else "autonomous mode"
+        log.info("Logged in as %s (%s).", self.user, mode)
 
     # ------------------------------------------------------------------
-    #  Decision logic
+    #  Prompt assembly
     # ------------------------------------------------------------------
 
-    def _get_channel_lock(self, channel_id):
-        if channel_id not in self.channel_locks:
-            self.channel_locks[channel_id] = asyncio.Lock()
-        return self.channel_locks[channel_id]
+    def _bot_name(self, guild: discord.Guild | None) -> str:
+        username = self.user.name
+        if guild and guild.me and guild.me.display_name != username:
+            return f"{username} (nickname in this server: {guild.me.display_name})"
+        return username
 
-    async def locked_evaluate_and_respond(self, channel_id, channel, trigger_message=None,
-                                           user_content=None, user_name=None):
-        async with self._get_channel_lock(channel_id):
-            if user_content is not None:
-                await add_message(self.db, channel_id, 'user', user_content, self.count_tokens, name=user_name)
-            await self.evaluate_and_respond(channel_id, channel, trigger_message=trigger_message)
-
-    async def locked_trigger_generation(self, channel_id, target, explicit=False, trigger_message=None,
-                                        user_content=None, user_name=None):
-        async with self._get_channel_lock(channel_id):
-            if user_content is not None:
-                await add_message(self.db, channel_id, 'user', user_content, self.count_tokens, name=user_name)
-            await self.trigger_generation(channel_id, target, explicit=explicit, trigger_message=trigger_message)
-
-    async def evaluate_and_respond(self, channel_id, channel, trigger_message=None):
-        """Use the triage LLM to decide whether to interject.
-
-        When the score is high enough, the triage model also returns the
-        response text directly, eliminating a second API call.
-        """
-        raw_history = await get_context(
-            self.db, channel_id, MAX_TOKEN_LIMIT,
-            self.bot_persona, self.count_tokens,
+    def _memory_scope(self, guild: discord.Guild | None) -> str:
+        # States how far memory reaches, since the bot gets asked and would guess
+        if self.memory is None:
+            return "off — you remember nothing once a conversation scrolls out of view"
+        if self.cfg.memory.scope != "per_server":
+            return "shared — the same memories everywhere you are, servers and DMs alike"
+        if guild is None:
+            return (
+                "kept per server, but direct messages share one memory between them; "
+                "what you remember here is not what you remember in any server"
+            )
+        return (
+            f"kept per server — these are your memories of {guild.name} only, and you "
+            f"have separate ones elsewhere"
         )
-        sanitized_history = get_sanitized_history(raw_history)
-        if not sanitized_history:
+
+    def _persona_scope(self, guild: discord.Guild | None) -> str:
+        # Describe how far a change to its own system prompt would reach
+        if self.persona_store is None:
+            return "fixed — you cannot change it"
+        if self.cfg.persona.scope != "per_server":
+            return "yours to change, and a change applies everywhere you are"
+        if guild is None:
+            return (
+                "yours to change; direct messages share one version, separate from "
+                "the one each server has"
+            )
+        return (
+            f"yours to change, but only here — this version is {guild.name}'s, and "
+            f"other servers keep their own"
+        )
+
+    def _system_prompt(self, guild: discord.Guild | None,
+                       present: list[str] | None = None,
+                       model: str | None = None) -> str:
+        guild_id = guild.id if guild else None
+        # The model is only settled in llm.complete, which renders this again with the one it picked
+        model = model or self.llm.current_model
+        # Rebuilt every turn from the store so edits apply immediately
+        base = (
+            self.persona_store.render(guild_id)
+            if self.persona_store is not None else self.persona
+        )
+        # Keep substitutions stable between turns so the prompt prefix stays cacheable.
+        # {model} is constant within a model's cache (see llm.complete's system_for).
+        prompt = (
+            base
+            .replace("{name}", self._bot_name(guild))
+            # The model actually called, which may be a fallback
+            .replace("{model}", model)
+            .replace("{memory_scope}", self._memory_scope(guild))
+            .replace("{persona_scope}", self._persona_scope(guild))
+            # Breaks prompt caching; the shipped prompt gets the time from utils.clock_line
+            .replace("{date}", time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime()))
+        )
+
+        if self.memory:
+            prompt += "\n\n" + self.memory.format_for_prompt(guild_id)
+        # Only people talking here are written out in full
+        if self.user_memory:
+            prompt += "\n\n" + self.user_memory.format_for_prompt(
+                present or [], guild_id
+            )
+        return prompt
+
+    # ------------------------------------------------------------------
+    #  Turn execution
+    # ------------------------------------------------------------------
+
+    async def run_turn(self, channel: discord.abc.Messageable,
+                       show_typing: bool = False) -> None:
+        # Show the model the conversation and let it decide what to do
+        channel_name = getattr(channel, "name", "DM")
+        guild = getattr(channel, "guild", None)
+
+        rows = await get_context(
+            self.db, channel.id,
+            token_budget=self.cfg.history.token_budget,
+            min_messages=self.cfg.history.min_messages,
+            max_messages=self.cfg.history.max_messages,
+        )
+        reactions = await get_reactions(
+            self.db, [row.get("message_id") for row in rows]
+        )
+        history, refs, oldest_ts = build_history(rows, reactions)
+        if not history:
+            log.warning("[#%s] No usable history (%d rows) — skipping turn.", channel_name, len(rows))
             return
 
-        # Build persona context once (shared between triage system prompt and inline persona)
-        persona_formatted = None
-        if self.bot_persona:
-            persona_formatted = self.bot_persona.replace(
-                '{date}', time.strftime('%Y-%m-%d %H:%M:%S %Z', time.localtime())
-            )
+        # Every name in the chat for the tools, and one entry per person for the prompt
+        participants = chat_participants(rows)
+        present = list(dict.fromkeys(participants.values()))
 
-        # social intelligence triage prompt — now also asks for a response
-        triage_system = (
-            "You are the social reasoning engine for an AI bot. Your goal is to decide if the bot should speak. "
-            "Examine the chat history. Provide a 'score' from 1 to 10 on how appropriate it is for you to reply. "
-            "Considerations:\n"
-            "- If users are asking you questions or talking about topics you like. Also if you are participating in a conversation or arguing with someone: Score High (8-10).\n"
-            "- If there is a joke you can complete or a factual error you can fix. Also when something baffles you so much you want to react: Score Medium (6-8).\n"
-            "- If the conversation is moving very fast between humans and you aren't needed: Score Low (1-4).\n"
-            "- If users have recently told you to be quiet or 'shut up', or are ignoring you: Score Very Low (1).\n\n"
-            f"THRESHOLD: If your score is >= {self.AUTONOMOUS_THRESHOLD}, you MUST also include a 'response' field "
-            "with the message you would send as the bot. Write the response fully in-character using your persona. "
-            "If your score is below the threshold, omit the 'response' field.\n\n"
-            "You may also optionally include a 'react' field with a SINGLE unicode emoji to react to the last "
-            "message with (e.g. \"💀\", \"😂\", \"🔥\"). Only react if it feels natural, not every time. "
+        # The clock goes after the history to keep the prompt prefix cacheable
+        payload: list[dict[str, Any]] = [
+            {"role": "system", "content": self._system_prompt(guild, present)},
+            *history,
+        ]
+        payload[-1]["content"] += "\n" + clock_line()
+
+        # From the rows, since the rendered history is one block for the whole channel
+        last_user_message = next(
+            (r["content"] for r in reversed(rows) if r["role"] == "user"), ""
         )
-        
-        if not DISABLE_MEMORY_SYSTEM:
-            triage_system += (
-                "MEMORY SYSTEM: You have a persistent memory. You MUST use this actively! Whenever you learn "
-                "something new about a user (their real name, preferences, opinions, running jokes, etc), "
-                "include an optional 'memory' field with {\"add\":[\"things to remember\"],\"remove\":[\"things to forget\"]}. "
-                "Keep memory items short, lowercase, and factual. Save anything that feels like a persistent detail. "
-                f"Memory limit: {MAX_MEMORIES} items. If full, remove old ones to make room. "
-                "You can use memory even if your score is low (to remember something without responding).\n\n"
-                "Output ONLY valid JSON: {\"score\": <int>, \"reasoning\": \"<string>\", \"response\": \"<string or omit>\", "
-                "\"react\": \"<emoji or omit>\", \"memory\": {\"add\": [...], \"remove\": [...]} or omit}"
-            )
-        else:
-            triage_system += (
-                "Output ONLY valid JSON: {\"score\": <int>, \"reasoning\": \"<string>\", \"response\": \"<string or omit>\", "
-                "\"react\": \"<emoji or omit>\"}"
-            )
 
-        if persona_formatted:
-            triage_system += f"\nYour Persona Context:\n{persona_formatted}"
+        ctx = TurnContext(
+            bot=self,
+            channel=channel,
+            guild=guild,
+            db=self.db,
+            memory=self.memory,
+            user_memory=self.user_memory,
+            persona=self.persona_store,
+            max_message_length=self.cfg.discord.max_message_length,
+            max_replies=self.cfg.tools.max_replies_per_turn,
+            max_members_listed=self.cfg.tools.max_members_listed,
+            max_channels_listed=self.cfg.tools.max_channels_listed,
+            message_refs=refs,
+            chat_users=participants,
+            oldest_visible_ts=oldest_ts,
+            on_reply=self._record_reply,
+        )
 
-        # Inject current memories into context
-        guild_id = self._get_guild_id(channel)
-        if not DISABLE_MEMORY_SYSTEM:
-            triage_system += "\n\n" + format_memories_for_prompt(guild_id)
-
-        payload = [{'role': 'system', 'content': triage_system}]
-        payload.extend(sanitized_history)
+        # Rebuilt per attempt so the prompt names the model actually serving the call
+        def system_for(model: str) -> str:
+            return self._system_prompt(guild, present, model)
 
         try:
-            triage_response = await call_llm_api(
-                self.openai_client, self.api_monitor,
-                payload, self.count_tokens, label="Triage",
+            if show_typing:
+                async with safe_typing(channel):
+                    await self._tool_loop(ctx, payload, last_user_message,
+                                          channel_name, system_for)
+            else:
+                await self._tool_loop(ctx, payload, last_user_message,
+                                      channel_name, system_for)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("[#%s] Turn failed", channel_name)
+
+    async def _tool_loop(self, ctx: TurnContext, payload: list[dict[str, Any]],
+                         last_user_message: str, channel_name: str,
+                         system_for: Callable[[str], str] | None = None) -> None:
+        # Run model round trips until it stops asking for information
+        for iteration in range(1, self.cfg.tools.max_iterations + 1):
+            reply = await self.llm.complete(
+                payload, self.tool_schemas, label=f"#{channel_name} {iteration}",
+                system_for=system_for,
             )
-            triage_response = re.sub(r'<(thought|think)>.*?</\1>\s*', '', triage_response, flags=re.DOTALL)
-            json_match = re.search(r'\{.*\}', triage_response, re.DOTALL)
-            if json_match:
-                data = json.loads(json_match.group(0))
-                score = int(data.get('score', 0))
-                reasoning = data.get('reasoning', '')
-                inline_response = data.get('response', '')
-                react_emoji = data.get('react', '')
 
-                logging.info(f"[Triage - #{channel.name}] Score: {score}/{self.AUTONOMOUS_THRESHOLD} | Reason: {reasoning}")
+            if not reply.tool_calls:
+                if reply.content and not ctx.acted:
+                    # Some models answer in prose instead of calling reply
+                    log.warning("[#%s] Model replied without a tool call; sending anyway.", channel_name)
+                    text = apply_easter_eggs(reply.content, last_user_message)
+                    await tool_module.tool_reply(ctx, text)
+                elif not ctx.acted:
+                    log.info("[#%s] Model chose to stay quiet.", channel_name)
+                return
 
-                # Process memory updates from triage JSON
-                if not DISABLE_MEMORY_SYSTEM:
-                    memory_data = data.get('memory', {})
-                    if memory_data:
-                        mem_adds = memory_data.get('add', [])
-                        mem_removes = memory_data.get('remove', [])
-                        if mem_adds or mem_removes:
-                            updated = apply_memory_updates(mem_adds, mem_removes, guild_id)
-                            logging.info(f"[Memory] Added: {mem_adds}, Removed: {mem_removes} | Total: {len(updated)}")
+            # Logged so repeated round trips can be explained
+            log.info(
+                "[#%s] Model called: %s", channel_name,
+                ", ".join(call.name for call in reply.tool_calls),
+            )
+            payload.append(reply.as_assistant_message())
+            wants_more = False
 
-                # Apply emoji reaction if provided
-                if react_emoji and trigger_message:
-                    try:
-                        await trigger_message.add_reaction(react_emoji.strip())
-                        logging.info(f"[Triage - #{channel.name}] Reacted with: {react_emoji}")
-                    except Exception as react_err:
-                        logging.warning(f"Failed to add reaction '{react_emoji}': {react_err}")
-
-                if score >= self.AUTONOMOUS_THRESHOLD:
-                    if inline_response and inline_response.strip():
-                        # Use the response from triage directly — no second API call needed
-                        logging.info(f"[Triage - #{channel.name}] Using inline response (saved 1 API call)")
-                        await self._send_triage_response(channel_id, channel, inline_response.strip(), reasoning)
-                    else:
-                        # Fallback: triage didn't include a response, do a separate generation call
-                        await self.trigger_generation(channel_id, channel, explicit=False, reasoning=reasoning)
-        except asyncio.TimeoutError:
-            logging.error(f"Triage evaluation failed: API request timed out after {API_TIMEOUT_SECONDS} seconds.")
-        except Exception as e:
-            logging.error(f"Triage evaluation failed: {e}", exc_info=True)
-
-    async def _send_triage_response(self, channel_id, channel, response_text, reasoning):
-        """Send a response that was generated inline by the triage model."""
-        async with safe_typing(channel):
-            try:
-                response_text = response_text.replace('\u200b', '')
-                response_text = re.sub(r'<(thought|think)>.*?</\1>\s*', '', response_text, flags=re.DOTALL)
-
-                channel_name = getattr(channel, 'name', 'DM')
-                logging.info(f"[LLM Response (triage-inline) - #{channel_name}] {response_text}")
-
-                await add_message(self.db, channel_id, 'assistant', response_text, self.count_tokens)
-
-                for chunk in split_message(response_text):
-                    await channel.send(chunk)
-                    await asyncio.sleep(0.5)
-
-            except Exception as e:
-                logging.error(f"Triage inline send error: {ascii(str(e))}", exc_info=True)
-                try:
-                    await channel.send(f"An error occurred: {str(e)}")
-                except Exception:
-                    pass
-
-    async def trigger_generation(self, channel_id, target, explicit=False, reasoning=None, trigger_message=None):
-        """Generate and send an LLM response."""
-        channel = target.channel if explicit else target
-        async with safe_typing(channel):
-            try:
-                raw_history = await get_context(
-                    self.db, channel_id, MAX_TOKEN_LIMIT,
-                    self.bot_persona, self.count_tokens,
-                )
-                sanitized_history = get_sanitized_history(raw_history)
-
-                if self.bot_persona:
-                    system_content = self.bot_persona.replace(
-                        '{date}', time.strftime('%Y-%m-%d %H:%M:%S %Z', time.localtime())
+            for call in reply.tool_calls:
+                tool = self.tools.get(call.name)
+                if tool is None:
+                    result = (
+                        f"There is no tool called {call.name!r}. "
+                        f"Available tools: {', '.join(self.tools)}."
                     )
+                    log.warning("[#%s] Model called unknown tool %r", channel_name, call.name)
                 else:
-                    system_content = "You are a helpful AI assistant."
+                    arguments = dict(call.arguments)
+                    if tool.name in ("reply", "reply_to") and "message" in arguments:
+                        arguments["message"] = apply_easter_eggs(
+                            str(arguments["message"]), last_user_message
+                        )
+                    result = await tool_module.execute(tool, ctx, arguments)
+                    wants_more = wants_more or tool.needs_followup
 
-                if not explicit and reasoning:
-                    system_content += f"\n\nInternal Note: You decided to interject because: '{reasoning}'."
+                payload.append({
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "name": call.name,
+                    "content": result,
+                })
 
-                # Allow the LLM to react with an emoji
-                system_content += (
-                    "\n\nYou may optionally react to the last message with an emoji. "
-                    "If you want to react, start your response with exactly [REACT:emoji] "
-                    "(e.g. [REACT:💀]) on the first line, then your message on the next line. "
-                    "Only react if it feels natural. Most of the time, just respond normally."
-                )
+            # Only read tools justify another API call
+            if not wants_more:
+                return
 
-                # Inject memory system
-                guild_id = self._get_guild_id(channel)
-                if not DISABLE_MEMORY_SYSTEM:
-                    system_content += self.MEMORY_INSTRUCTIONS
-                    system_content += "\n" + format_memories_for_prompt(guild_id)
+        log.warning(
+            "[#%s] Hit the %d-iteration limit ([tools] max_iterations)%s.",
+            channel_name, self.cfg.tools.max_iterations,
+            "" if ctx.acted else " without the model ever saying anything",
+        )
 
-                payload = [{'role': 'system', 'content': system_content}]
-                payload.extend(sanitized_history)
-
-                response_text = await call_llm_api(
-                    self.openai_client, self.api_monitor,
-                    payload, self.count_tokens,
-                )
-                response_text = response_text.replace('\u200b', '')
-
-                # strip out thought blocks
-                response_text = re.sub(r'<(thought|think)>.*?</\1>\s*', '', response_text, flags=re.DOTALL)
-
-                # Process memory updates before sending
-                response_text = self._process_memory_block(response_text, guild_id)
-
-                # extract and apply emoji reaction if present
-                react_match = re.match(r'^\[REACT:(.+?)\]\s*\n?', response_text)
-                if react_match and (trigger_message or (explicit and target)):
-                    react_emoji = react_match.group(1).strip()
-                    react_target = trigger_message if trigger_message else target
-                    try:
-                        await react_target.add_reaction(react_emoji)
-                        logging.info(f"[Generation] Reacted with: {react_emoji}")
-                    except Exception as react_err:
-                        logging.warning(f"Failed to add reaction '{react_emoji}': {react_err}")
-                    response_text = response_text[react_match.end():].strip()
-
-                # easter egg check
-                user_message_lower = target.clean_content.lower() if explicit else (
-                    sanitized_history[-1]['content'].lower() if sanitized_history else ""
-                )
-                if any(k in user_message_lower for k in ['woke', 'robot', 'liberal']):
-                    response_text = response_text.rstrip() + " I hit the jack pot! $                  1"
-
-                channel_name = getattr(channel, 'name', 'DM')
-                logging.info(f"[LLM Response - #{channel_name}] {response_text}")
-
-                await add_message(self.db, channel_id, 'assistant', response_text, self.count_tokens)
-
-                for chunk in split_message(response_text):
-                    if explicit:
-                        await target.reply(chunk)
-                    else:
-                        await channel.send(chunk)
-                    await asyncio.sleep(0.5)
-
-            except asyncio.TimeoutError:
-                logging.error(f"Generation Error: API request timed out after {API_TIMEOUT_SECONDS} seconds.")
-                error_msg = f"Error: The LLM took more than {API_TIMEOUT_SECONDS} seconds to respond (timed out)."
-                try:
-                    if explicit:
-                        await target.reply(error_msg)
-                    else:
-                        await channel.send(error_msg)
-                except Exception:
-                    pass
-            except Exception as e:
-                logging.error(f"Generation Error: {ascii(str(e))}", exc_info=True)
-                error_msg = f"An error occurred: {str(e)}"
-                try:
-                    if explicit:
-                        await target.reply(error_msg)
-                    else:
-                        await channel.send(error_msg)
-                except Exception:
-                    pass
+    async def _record_reply(self, text: str, sent: discord.Message) -> None:
+        await add_message(
+            self.db, sent.channel.id, "assistant", text, self.count_tokens,
+            message_id=sent.id, author_id=self.user.id,
+        )
 
     # ------------------------------------------------------------------
-    #  Troll mode
+    #  Message intake
     # ------------------------------------------------------------------
 
-    async def _manage_typing(self):
-        if not self.last_troll_channel:
+    def _lock_for(self, channel_id: int) -> asyncio.Lock:
+        return self._channel_locks.setdefault(channel_id, asyncio.Lock())
+
+    async def _handle_message(self, message: discord.Message, content: str,
+                              author: str, show_typing: bool) -> None:
+        # Store the message and take a turn, one channel at a time
+        async with self._lock_for(message.channel.id):
+            await add_message(
+                self.db, message.channel.id, "user", content, self.count_tokens,
+                name=author, message_id=message.id, author_id=message.author.id,
+            )
+            await self.run_turn(message.channel, show_typing=show_typing)
+
+    async def on_message(self, message: discord.Message) -> None:
+        if self.user is None or message.author.id == self.user.id:
             return
-        async with safe_typing(self.last_troll_channel):
-            while time.time() - getattr(self, 'last_keystroke_time', 0) < 5:
-                await asyncio.sleep(1)
-
-    async def troll_input_worker(self):
-        import utils  # access mutable module-level input_buffer
-
-        loop = asyncio.get_running_loop()
-        print("\n--- Troll mode active. Type your response at any time and press Enter to send it. ---")
-
-        root_logger = logging.getLogger()
-        for handler in root_logger.handlers[:]:
-            if isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler):
-                root_logger.removeHandler(handler)
-
-        troll_handler = TrollConsoleHandler()
-        troll_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-        root_logger.addHandler(troll_handler)
-
-        def read_input_sync():
-            import msvcrt
-
-            with utils.input_lock:
-                sys.stdout.write("> " + utils.input_buffer)
-                sys.stdout.flush()
-
-            while True:
-                char = msvcrt.getwch()
-
-                if char in ('\x00', '\xe0'):
-                    msvcrt.getwch()
-                    continue
-
-                if char == '\r' or char == '\n':
-                    with utils.input_lock:
-                        final_input = utils.input_buffer
-                        utils.input_buffer = ""
-                        sys.stdout.write('\n')
-                        sys.stdout.flush()
-                    return final_input
-                elif char == '\b':
-                    with utils.input_lock:
-                        if len(utils.input_buffer) > 0:
-                            utils.input_buffer = utils.input_buffer[:-1]
-                            sys.stdout.write('\b \b')
-                            sys.stdout.flush()
-                elif char == '\x03':  # Ctrl+C
-                    raise KeyboardInterrupt
-                else:
-                    with utils.input_lock:
-                        utils.input_buffer += char
-                        sys.stdout.write(char)
-                        sys.stdout.flush()
-
-                    loop.call_soon_threadsafe(trigger_typing)
-
-        def trigger_typing():
-            if self.last_troll_channel:
-                self.last_keystroke_time = time.time()
-                if not hasattr(self, 'typing_task') or self.typing_task is None or self.typing_task.done():
-                    self.typing_task = loop.create_task(self._manage_typing())
-
-        while True:
-            try:
-                response_text = await loop.run_in_executor(None, read_input_sync)
-                response_text = response_text.strip()
-                if response_text:
-                    if self.last_troll_channel:
-                        async with safe_typing(self.last_troll_channel):
-                            await add_message(
-                                self.db, self.last_troll_channel.id,
-                                'assistant', response_text, self.count_tokens,
-                            )
-                            for chunk in split_message(response_text):
-                                await self.last_troll_channel.send(chunk)
-                                await asyncio.sleep(0.5)
-                    else:
-                        logging.warning("No active channel to send message to.")
-            except (EOFError, KeyboardInterrupt):
-                break
-            except Exception as e:
-                logging.error(f"Input worker error: {e}")
-
-    # ------------------------------------------------------------------
-    #  Event handlers
-    # ------------------------------------------------------------------
-
-    async def on_ready(self):
-        logging.info(f'Logged in as {self.user}. Autonomous mode active (LLM-determined interjections).')
-
-    async def on_message(self, message):
-        if message.author == self.user:
+        if self.cfg.discord.ignore_bots and message.author.bot:
+            return
+        if message.guild is None and not self.cfg.discord.allow_dms:
             return
 
-        channel_id = message.channel.id
-        mentioned = self.user.mentioned_in(message)
-
-        user_content_clean = message.clean_content
-        if mentioned:
-            user_content_clean = user_content_clean.replace(f"@{self.user.name}", "").strip()
-
-        if message.reference and message.reference.resolved:
-            ref = message.reference.resolved
-            user_content_clean = f'[replying to {ref.author.display_name}: "{ref.clean_content[:200]}"]\n{user_content_clean}'
-
-        display_name = message.author.display_name
-        username = message.author.name
-        full_name = f"{display_name} (nickname: {username})" if display_name != username else display_name
-
-        channel_name = getattr(message.channel, 'name', 'DM')
-        logging.info(f"[User Message - #{channel_name}] {full_name}: {user_content_clean}")
+        content = self._describe(message)
+        author = self._author_name(message.author)
+        channel_name = getattr(message.channel, "name", "DM")
+        log.info("[#%s] %s: %s", channel_name, author, content)
 
         if self.troll_mode:
-            # In troll mode, write immediately (no lock contention)
-            await add_message(self.db, channel_id, 'user', user_content_clean, self.count_tokens, name=full_name)
             self.last_troll_channel = message.channel
-        elif mentioned:
-            # explicit mention — user message is written inside the lock to prevent ordering races
-            asyncio.create_task(self.locked_trigger_generation(
-                channel_id, message, explicit=True, trigger_message=message,
-                user_content=user_content_clean, user_name=full_name,
-            ))
+            await add_message(
+                self.db, message.channel.id, "user", content, self.count_tokens,
+                name=author, message_id=message.id, author_id=message.author.id,
+            )
+            return
+
+        task = asyncio.create_task(
+            self._handle_message(
+                message, content, author,
+                show_typing=self.user.mentioned_in(message),
+            )
+        )
+        # Keep a reference so the task is not garbage collected
+        self._turns.add(task)
+        task.add_done_callback(self._turns.discard)
+
+    # ------------------------------------------------------------------
+    #  Edits and reactions
+    # ------------------------------------------------------------------
+
+    async def on_raw_message_edit(self, payload: discord.RawMessageUpdateEvent) -> None:
+        # Updates the stored message but takes no turn; the raw event carries the full Message
+        if self.db is None or self.user is None:
+            return
+
+        message = getattr(payload, "message", None)
+        if message is None:
+            return
+
+        content = self._describe(message)
+        if not await update_message(self.db, payload.message_id, content, self.count_tokens):
+            return  # Not a message the bot has
+
+        log.info("[#%s] Edited: %s", self._channel_name(payload.channel_id), content)
+
+    async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
+        # Records the reaction but takes no turn. Raw event, since on_reaction_add
+        # only fires for cached messages (none after a restart).
+        if self.db is None or self.user is None:
+            return
+
+        reactor = payload.member
+        if reactor is not None and reactor.bot and reactor.id != self.user.id:
+            if self.cfg.discord.ignore_bots:
+                return
+
+        # Keep its own reactions so it knows what it has reacted to
+        if payload.user_id == self.user.id:
+            name = "you"
+        elif reactor is not None:
+            name = self._author_name(reactor)
         else:
-            # autonomous evaluation — user message is written inside the lock to prevent ordering races
-            asyncio.create_task(self.locked_evaluate_and_respond(
-                channel_id, message.channel, trigger_message=message,
-                user_content=user_content_clean, user_name=full_name,
-            ))
+            user = self.get_user(payload.user_id)
+            name = self._author_name(user) if user else "someone"
+
+        recorded = await add_reaction(
+            self.db, payload.channel_id, payload.message_id, str(payload.emoji),
+            name=name, author_id=payload.user_id,
+        )
+        if recorded:
+            log.info(
+                "[#%s] %s reacted %s", self._channel_name(payload.channel_id),
+                name, payload.emoji,
+            )
+
+    async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent) -> None:
+        if self.db is None:
+            return
+        await remove_reaction(self.db, payload.message_id, str(payload.emoji), payload.user_id)
+
+    def _channel_name(self, channel_id: int) -> str:
+        channel = self.get_channel(channel_id)
+        return getattr(channel, "name", "DM")
+
+    @staticmethod
+    def _author_name(author: discord.abc.User) -> str:
+        display = author.display_name
+        return f"{author.name} (nickname: {display})" if display != author.name else display
+
+    def _describe(self, message: discord.Message) -> str:
+        # Bot mentions are left in (as @display_name) so the prompt can treat them as aimed at it
+        content = message.clean_content.strip()
+
+        reference = message.reference.resolved if message.reference else None
+        if isinstance(reference, discord.Message):
+            quoted = reference.clean_content[:200]
+            content = (
+                f'[replying to {reference.author.display_name}: "{quoted}"]\n{content}'
+            )
+
+        if message.attachments:
+            names = ", ".join(a.filename for a in message.attachments)
+            content = f"{content}\n[attached: {names}]".strip()
+
+        return content or "(empty message)"
+
+    # ------------------------------------------------------------------
+    #  Troll mode support
+    # ------------------------------------------------------------------
+
+    async def send_as_bot(self, channel: discord.abc.Messageable, text: str) -> None:
+        # Send a hand-written message and record it as the bot's own
+        sent = None
+        async with safe_typing(channel):
+            for chunk in split_message(text, self.cfg.discord.max_message_length):
+                sent = await channel.send(chunk)
+        if sent is not None:
+            await self._record_reply(text, sent)

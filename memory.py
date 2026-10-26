@@ -1,80 +1,104 @@
-"""
-memory.py — Persistent memory system for Viral.
-Loads/saves a simple JSON list of memory strings.
-Supports global or per-guild scoping via config.
-"""
+# Persistent long-term facts, stored as a JSON list per scope.
+# Writes go through a temp file and atomic replace.
+
+from __future__ import annotations
 
 import json
 import logging
 import os
+from pathlib import Path
 
-from config import MAX_MEMORIES, MEMORY_SCOPE
+from config import MemoryConfig
 
-MEMORY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "memories")
-
-
-def _memory_file(guild_id=None):
-    """Return the path to the appropriate memory file."""
-    os.makedirs(MEMORY_DIR, exist_ok=True)
-    if MEMORY_SCOPE == "per_server" and guild_id is not None:
-        return os.path.join(MEMORY_DIR, f"memory_{guild_id}.json")
-    return os.path.join(MEMORY_DIR, "memory_global.json")
+log = logging.getLogger(__name__)
 
 
-def load_memories(guild_id=None) -> list[str]:
-    """Load the current memory list from disk."""
-    path = _memory_file(guild_id)
-    if not os.path.isfile(path):
-        return []
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data.get("memories", [])
-    except Exception as e:
-        logging.error(f"Failed to load memories from {path}: {e}")
-        return []
+class MemoryStore:
+    def __init__(self, cfg: MemoryConfig, directory: Path):
+        self.cfg = cfg
+        self.directory = directory
 
+    # ------------------------------------------------------------------
 
-def save_memories(memories: list[str], guild_id=None):
-    """Persist the memory list to disk."""
-    path = _memory_file(guild_id)
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump({"memories": memories}, f, indent=2, ensure_ascii=False)
-    except Exception as e:
-        logging.error(f"Failed to save memories to {path}: {e}")
+    def _file(self, guild_id: int | None) -> Path:
+        self.directory.mkdir(parents=True, exist_ok=True)
+        if self.cfg.scope == "per_server" and guild_id is not None:
+            return self.directory / f"memory_{guild_id}.json"
+        return self.directory / "memory_global.json"
 
+    def load(self, guild_id: int | None = None) -> list[str]:
+        path = self._file(guild_id)
+        if not path.is_file():
+            return []
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            log.exception("Failed to load memories from %s", path)
+            return []
+        memories = data.get("memories", []) if isinstance(data, dict) else []
+        return [m for m in memories if isinstance(m, str) and m.strip()]
 
-def apply_memory_updates(adds: list[str], removes: list[str], guild_id=None) -> list[str]:
-    """Add/remove memories and save. Returns the updated list."""
-    memories = load_memories(guild_id)
+    def save(self, memories: list[str], guild_id: int | None = None) -> None:
+        path = self._file(guild_id)
+        tmp = path.with_suffix(".json.tmp")
+        try:
+            tmp.write_text(
+                json.dumps({"memories": memories}, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            os.replace(tmp, path)
+        except OSError:
+            log.exception("Failed to save memories to %s", path)
+            tmp.unlink(missing_ok=True)
 
-    # Remove first (case-insensitive matching)
-    for r in removes:
-        r_lower = r.strip().lower()
-        memories = [m for m in memories if m.strip().lower() != r_lower]
+    # ------------------------------------------------------------------
 
-    # Then add (skip duplicates)
-    existing_lower = {m.strip().lower() for m in memories}
-    for a in adds:
-        a = a.strip()
-        if a and a.lower() not in existing_lower:
-            memories.append(a)
-            existing_lower.add(a.lower())
+    def remember(self, fact: str, guild_id: int | None = None) -> tuple[bool, str]:
+        # Add one fact. Returns (changed, human-readable outcome)
+        fact = fact.strip()
+        if not fact:
+            return False, "Nothing was saved: the fact was empty."
 
-    # Enforce cap — keep newest
-    if len(memories) > MAX_MEMORIES:
-        memories = memories[-MAX_MEMORIES:]
+        memories = self.load(guild_id)
+        if any(m.strip().lower() == fact.lower() for m in memories):
+            return False, "Already remembered — nothing changed."
 
-    save_memories(memories, guild_id)
-    return memories
+        memories.append(fact)
+        dropped = ""
+        if len(memories) > self.cfg.max_memories:
+            removed = memories[: len(memories) - self.cfg.max_memories]
+            memories = memories[-self.cfg.max_memories :]
+            dropped = f" Memory was full, so the oldest was dropped: {removed[0]!r}."
 
+        self.save(memories, guild_id)
+        return True, f"Saved. You now remember {len(memories)}/{self.cfg.max_memories} facts.{dropped}"
 
-def format_memories_for_prompt(guild_id=None) -> str:
-    """Format memories as a block to inject into the system prompt."""
-    memories = load_memories(guild_id)
-    header = "Your personal memories (things you've chosen to remember):"
-    if not memories:
-        return f"{header}\n(none yet)"
-    bullets = "\n".join(f"- {m}" for m in memories)
-    return f"{header}\n{bullets}"
+    def forget(self, fact: str, guild_id: int | None = None) -> tuple[bool, str]:
+        # Remove one fact by exact (case-insensitive) text
+        target = fact.strip().lower()
+        memories = self.load(guild_id)
+        kept = [m for m in memories if m.strip().lower() != target]
+
+        if len(kept) == len(memories):
+            return False, (
+                "No memory matched that text, so nothing was removed. Everything "
+                "you remember is listed in your system prompt; a fact has to be "
+                "quoted from there word for word to be forgotten."
+            )
+
+        self.save(kept, guild_id)
+        return True, f"Forgotten. {len(kept)} facts remain."
+
+    # ------------------------------------------------------------------
+
+    def format_for_prompt(self, guild_id: int | None = None) -> str:
+        # States the limit so the bot knows saving may drop the oldest
+        memories = self.load(guild_id)
+        limit = self.cfg.max_memories
+        header = (
+            f"Things you have chosen to remember — you hold {len(memories)} of "
+            f"{limit}, and once full, saving another drops the oldest:"
+        )
+        if not memories:
+            return f"{header}\n(nothing yet)"
+        return header + "\n" + "\n".join(f"- {m}" for m in memories)

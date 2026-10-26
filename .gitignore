@@ -33,6 +33,15 @@ Desktop.ini
 
 # Environment / Secrets
 .env
+config.jsonc
+config.json
 
 # Memories
 memories/
+
+# Self-written persona and its backups (prompt/persona.txt is the committed source)
+persona/
+persona_backups/
+
+# Claude Code
+.claude/

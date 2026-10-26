@@ -1,0 +1,237 @@
+# ============================================================================
+#  Viralflooring — configuration
+#
+#  Secrets live in .env, not here. Copy .env.example to .env and fill it in.
+# ============================================================================
+
+
+[discord]
+# Ignore messages from other bots (including webhooks).
+ignore_bots = true
+# Respond in direct messages as well as servers.
+allow_dms = true
+# Discord's per-message limit. Longer replies are split automatically.
+max_message_length = 2000
+# Request the Server Members privileged intent, so get_server_info can list the
+# full member roster. Also needs "Server Members Intent" enabled at
+# https://discord.com/developers/applications (Bot > Privileged Gateway
+# Intents) — on here but off there and the bot will not start.
+member_intent = false
+
+
+[llm]
+# Backend to talk to: "local" (llama.cpp or any OpenAI-compatible server),
+# "gemini", or "mistral". Only the matching [llm.*] table below is used.
+backend = "gemini"
+
+# Hard cap on tokens generated per API call. Reasoning traces count against it.
+max_output_tokens = 1000
+
+# Stall detector, not headroom. Calls that work return in a couple of seconds;
+# the ones that hang never arrive. Every second above a normal answer is a
+# second a hung request costs before the next model in the chain is tried.
+timeout_seconds = 12.0
+
+# Minimum seconds between API calls. 2.0 caps the bot at 30 calls a minute,
+# which is ministral-14b-latest's request limit. The limiter below meters
+# tokens, not requests, so on a request-capped provider this is the only thing
+# holding that line.
+cooldown_seconds = 2.0
+
+# Retries on 429s, 5xx and connection errors, handled by the OpenAI SDK.
+max_retries = 3
+
+# Input tokens allowed per minute, or 0 for no limit. Calls wait for room
+# rather than being rejected. Every call resends the system prompt, the tool
+# definitions and the history, and the count is estimated at four characters
+# per token, so leave headroom.
+#
+# Set for gemini, whose free tier is the tightest at ~16000/min. On mistral
+# raise it to 120000: ministral-14b-latest allows 937500 tokens a minute and
+# caps requests at 30, so cooldown_seconds becomes the binding limit instead.
+#
+# `python bot.py --check` prints what one call currently costs.
+input_tokens_per_minute = 15000
+
+# How long to leave a rate-limited model alone when the provider does not name
+# a delay itself. Only decides when the preferred model is retried — nothing
+# waits this out while another model in the chain is free.
+fallback_cooldown_seconds = 60.0
+
+# Reasoning budget: "auto", "none", "minimal", "low", "medium", or "high".
+# Backends without reasoning control ignore it.
+#
+# Do not use "none" on gemini. Its 3.x models refuse to disable thinking, so
+# "none" is dropped rather than sent, and a Gemini-endpoint model on its own
+# default stops calling tools and answers in prose. "auto" sends "minimal".
+reasoning_effort = "auto"
+
+
+[llm.local]
+base_url = "http://127.0.0.1:8080/v1"
+model = "default"
+
+[llm.gemini]
+model = "gemma-4-31b-it"
+
+# Models to try, in order, while `model` is rate limited. Gemini counts free
+# quota per model, so a 429 on one says nothing about the next. The chain is
+# always tried from the top, so `model` resumes on its own. [] turns it off.
+fallback_models = [
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemma-4-26b-a4b-it",
+]
+
+[llm.mistral]
+# A free key cannot reach the premier models: mistral-medium-*, mistral-small-*
+# and magistral-* are provisioned 0 requests a minute and Mistral reports that
+# as a 429 "Rate limit exceeded", which reads like spent quota when nothing has
+# been spent. The ministral family is what a free key calls.
+model = "ministral-14b-latest"
+
+# All free-tier and function-calling, in descending order of capability.
+# Measured request limits: 14b 30/min, 8b 188/min, 3b 750/min — so the chain
+# also widens as it goes down, and a fallback can absorb a burst 14b cannot.
+fallback_models = [
+    "ministral-8b-latest",
+    "ministral-3b-latest",
+]
+
+
+[persona]
+# The system prompt is two files, so what the bot can and cannot change is
+# obvious from where it lives:
+#
+#   fixed_file    never changes — how tools are called, how to read the chat,
+#                 and what the bot is told about its situation. Holds a
+#                 {persona} marker showing where the other file is dropped in.
+#   persona_file  who it is, when it speaks, and what it will not do, the rule
+#                 against leaking instructions included. Every "## TITLE"
+#                 section is one the bot may rewrite while running, if
+#                 self_edit_enabled is on.
+#
+# Both support {name}, {model}, {memory_scope} and {persona_scope}.
+#
+# {date} also works but the shipped prompt avoids it: every backend caches on a
+# shared prefix, so a clock at the top throws away the cache and every token
+# after it (~4,500, tool schemas and persona included). The bot is given the
+# time on the last line of the chat instead.
+fixed_file = "prompt/fixed.txt"
+persona_file = "prompt/persona.txt"
+
+# Let the bot rewrite persona_file's sections through the edit_system_prompt
+# tool. Everything in fixed_file stays out of reach, so no edit can stop the
+# bot working, and neither file is written to — persona_file is the seed, and
+# `python bot.py --reset-persona` restores it. A batch of edits either all
+# applies or none of it does.
+#
+# Nothing stops a user talking it into an edit. If that matters, leave this
+# off, or drop edit_system_prompt from [tools] enabled.
+self_edit_enabled = true
+
+# "global" — one persona everywhere. "per_server" — one per server, each
+# seeded from persona_file.
+scope = "per_server"
+
+# Caps on what the bot may write. Lines already in persona_file are used as
+# authored, whatever their length.
+max_lines_per_section = 20
+max_line_length = 600
+
+# Previous versions kept in persona_backups/. 0 for none.
+backup_count = 20
+
+
+[history]
+# SQLite file storing per-channel conversation history.
+db_file = "history.db"
+# Token budget for the chat history. The system prompt is not counted here.
+token_budget = 6000
+# Always include at least this many recent messages, even if over budget.
+min_messages = 12
+# Never look further back than this many messages.
+max_messages = 50
+
+
+[memory]
+# Long-term facts the bot chooses to remember about people. The memory list is
+# always put in the system prompt.
+enabled = true
+# "global" — one shared memory file. "per_server" — one per guild.
+scope = "per_server"
+# Maximum facts stored; oldest are dropped at the limit. The bot is told this
+# number and how many it is using.
+max_memories = 50
+
+
+[memory.users]
+# The other half of memory: facts filed under one person, so what the bot knows
+# about somebody stays together instead of competing for room in the list above.
+#
+# Only the people actually talking in a channel go in the prompt. Everyone else
+# is a name on a roster the bot reads with get_user_memories, so knowing fifty
+# people costs fifty people's tokens only when they turn up.
+#
+# Scope follows [memory] scope. Requires [memory] enabled — when that is off,
+# the three per-person tools are not offered at all, whatever [tools] says.
+enabled = true
+
+# How many people it may keep notes on. When full, the person whose notes have
+# gone longest without a change is dropped, and the bot is told who it lost.
+max_users = 100
+
+# How many facts per person. Oldest goes first when full.
+max_facts_per_user = 15
+
+
+[tools]
+# Which tools the model may call. Remove a name to disable it.
+#   reply / reply_to     send a message, plain or as a Discord reply
+#   react                add an emoji reaction
+#   remember / forget    add or delete a long-term fact  ([memory] enabled)
+#   remember_about_user / forget_about_user / get_user_memories
+#                                             ([memory.users] enabled)
+#   search_history       search older messages in this channel
+#   set_nickname         change its nickname in the current server
+#   set_status           change its Discord status text
+#   get_server_info      server name, channels, members, where it is talking
+#   edit_system_prompt   rewrite its own persona sections
+#                                    ([persona] self_edit_enabled)
+enabled = [
+    "reply",
+    "reply_to",
+    "react",
+    "remember",
+    "forget",
+    "remember_about_user",
+    "forget_about_user",
+    "get_user_memories",
+    "search_history",
+    "set_nickname",
+    "set_status",
+    "get_server_info",
+    "edit_system_prompt",
+]
+
+# Maximum model round trips per incoming message. Tools that hand something
+# back cost a round trip, so the model can act on the answer; this stops
+# runaway loops.
+max_iterations = 4
+
+# Maximum messages the bot may send in response to one incoming message.
+max_replies_per_turn = 2
+
+# Caps on get_server_info, so a big server cannot flood the prompt.
+max_members_listed = 50
+max_channels_listed = 40
+
+
+[logging]
+# "DEBUG", "INFO", "WARNING", "ERROR"
+level = "INFO"
+# Log file path, or "" to log only to the console.
+file = "bot.log"
+# Rotate at this size, keeping `backup_count` old files.
+max_bytes = 5_000_000
+backup_count = 2

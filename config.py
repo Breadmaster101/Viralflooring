@@ -1,143 +1,387 @@
-"""
-config.py — Loads configuration from config.jsonc (or config.json fallback),
-resolves LLM backend settings, and exports all constants used by the bot.
-"""
+# Typed config from config.toml; secrets come from the environment or .env
 
-import json
-import re
-import logging
-import sys
+from __future__ import annotations
+
 import os
+import tomllib
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parent
+CONFIG_FILE = ROOT / "config.toml"
+ENV_FILE = ROOT / ".env"
+
+REASONING_LEVELS = ("auto", "none", "minimal", "low", "medium", "high")
+MEMORY_SCOPES = ("global", "per_server")
+PERSONA_SCOPES = MEMORY_SCOPES
+LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+
+
+class ConfigError(Exception):
+    # Raised when config.toml is missing, malformed, or has a bad value
+    pass
+
 
 # ---------------------------------------------------------------------------
-#  JSONC loader (strips // comments before parsing)
+#  Backend registry
 # ---------------------------------------------------------------------------
 
-def _load_jsonc(path):
-    """Load a JSONC file (JSON with // line comments)."""
-    with open(path, "r", encoding="utf-8") as f:
-        raw = f.read()
-    # Remove single-line // comments (but not inside strings)
-    stripped = re.sub(r'(?<!["\':])//.*', '', raw)
-    return json.loads(stripped)
+@dataclass(frozen=True)
+class Backend:
+    name: str
+    env_key: str
+    base_url: str | None  # None => must be supplied in the backend's own table
+    default_model: str
+    # Models to try, in order, while the chosen one is rate limited. Only worth
+    # setting where the provider counts quota per model rather than per project.
+    fallbacks: tuple[str, ...] = ()
 
 
-def _load_config():
-    """Try config.jsonc first, then fall back to config.json."""
-    for filename in ("config.jsonc", "config.json"):
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
-        if os.path.isfile(path):
-            try:
-                data = _load_jsonc(path) if filename.endswith(".jsonc") else json.load(open(path, encoding="utf-8"))
-                logging.info(f"Loaded configuration from {filename}")
-                return data
-            except Exception as e:
-                logging.critical(f"Failed to parse {filename}: {e}")
-                sys.exit(1)
-    logging.critical("No config file found! Create config.jsonc (or config.json).")
-    sys.exit(1)
-
-
-config = _load_config()
-
-# ---------------------------------------------------------------------------
-#  Discord
-# ---------------------------------------------------------------------------
-
-DISCORD_TOKEN = config.get("DISCORD_TOKEN", "your-discord-bot-token")
-
-# ---------------------------------------------------------------------------
-#  Main LLM backend
-# ---------------------------------------------------------------------------
-
-LLM_BACKEND = config.get("LLM_BACKEND", "cerebras")
-
-# Local
-LLAMA_BASE_URL = config.get("LLAMA_BASE_URL", "http://127.0.0.1:8080/v1")
-LLAMA_API_KEY  = config.get("LLAMA_API_KEY", "sk-no-key-required")
-LLAMA_MODEL_ID = config.get("LLAMA_MODEL_ID", "default")
-
-# Gemini
-GEMINI_API_KEY  = config.get("GEMINI_API_KEY", "your-gemini-api-key")
-GEMINI_MODEL_ID = config.get("GEMINI_MODEL_ID", "gemini-3.1-flash-lite-preview")
-
-# OpenRouter
-OPENROUTER_API_KEY  = config.get("OPENROUTER_API_KEY", "your-openrouter-api-key")
-OPENROUTER_MODEL_ID = config.get("OPENROUTER_MODEL_ID", "google/gemma-3-27b-it:free")
-
-# Cerebras
-CEREBRAS_API_KEY  = config.get("CEREBRAS_API_KEY", "your-cerebras-api-key")
-CEREBRAS_MODEL_ID = config.get("CEREBRAS_MODEL_ID", "qwen-3-235b-2507")
-
-# Mistral
-MISTRAL_API_KEY  = config.get("MISTRAL_API_KEY", "your-mistral-api-key")
-MISTRAL_MODEL_ID = config.get("MISTRAL_MODEL_ID", "mistral-large-latest")
-
-# ---------------------------------------------------------------------------
-#  Thinking / reasoning control
-# ---------------------------------------------------------------------------
-
-DISABLE_GEMINI_THINKING       = config.get("DISABLE_GEMINI_THINKING", False)
-
-# ---------------------------------------------------------------------------
-#  General settings
-# ---------------------------------------------------------------------------
-
-MAX_TOKEN_LIMIT      = config.get("MAX_TOKEN_LIMIT", 1000)
-DB_FILE              = config.get("DB_FILE", "history.db")
-MAX_DISCORD_MSG_LEN  = config.get("MAX_DISCORD_MSG_LEN", 2000)
-API_COOLDOWN_SECONDS = config.get("API_COOLDOWN_SECONDS", 1.0)
-API_TIMEOUT_SECONDS  = config.get("API_TIMEOUT_SECONDS", 60.0)
-
-# ---------------------------------------------------------------------------
-#  Memory system
-# ---------------------------------------------------------------------------
-
-DISABLE_MEMORY_SYSTEM = config.get("DISABLE_MEMORY_SYSTEM", False)
-MEMORY_SCOPE   = config.get("MEMORY_SCOPE", "global")    # "global" or "per_server"
-MAX_MEMORIES   = config.get("MAX_MEMORIES", 40)
-
-# ---------------------------------------------------------------------------
-#  Resolve backend → (base_url, api_key, model_id)
-# ---------------------------------------------------------------------------
-
-_BACKEND_MAP = {
-    "local":      lambda bu, ak, mi: (bu, ak, mi),
-    "gemini":     lambda bu, ak, mi: ("https://generativelanguage.googleapis.com/v1beta/openai/", ak, mi),
-    "openrouter": lambda bu, ak, mi: ("https://openrouter.ai/api/v1", ak, mi),
-    "cerebras":   lambda bu, ak, mi: ("https://api.cerebras.ai/v1", ak, mi),
-    "mistral":    lambda bu, ak, mi: ("https://api.mistral.ai/v1", ak, mi),
+BACKENDS: dict[str, Backend] = {
+    "local": Backend("local", "LOCAL_API_KEY", None, "default"),
+    "gemini": Backend(
+        "gemini", "GEMINI_API_KEY",
+        "https://generativelanguage.googleapis.com/v1beta/openai/",
+        "gemini-3.1-flash-lite",
+        fallbacks=(
+            "gemini-3.5-flash-lite",
+            "gemini-3.1-flash-lite",
+            "gemma-4-26b-a4b-it",
+        ),
+    ),
+    "mistral": Backend(
+        "mistral", "MISTRAL_API_KEY",
+        "https://api.mistral.ai/v1", "mistral-medium-3-5",
+    ),
 }
 
 
-def _resolve(backend, local_url, local_key, local_model,
-             gemini_key, gemini_model,
-             openrouter_key, openrouter_model,
-             cerebras_key, cerebras_model,
-             mistral_key, mistral_model):
-    if backend == "local":
-        return local_url, local_key, local_model
-    elif backend == "gemini":
-        return "https://generativelanguage.googleapis.com/v1beta/openai/", gemini_key, gemini_model
-    elif backend == "openrouter":
-        return "https://openrouter.ai/api/v1", openrouter_key, openrouter_model
-    elif backend == "cerebras":
-        return "https://api.cerebras.ai/v1", cerebras_key, cerebras_model
-    elif backend == "mistral":
-        return "https://api.mistral.ai/v1", mistral_key, mistral_model
-    else:
-        raise ValueError(
-            f"Unknown LLM backend: '{backend}'. Must be 'local', 'gemini', 'openrouter', 'cerebras', or 'mistral'."
+# ---------------------------------------------------------------------------
+#  Config sections
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class DiscordConfig:
+    token: str
+    ignore_bots: bool = True
+    allow_dms: bool = True
+    max_message_length: int = 2000
+    member_intent: bool = False
+
+
+@dataclass(frozen=True)
+class LLMConfig:
+    backend: str
+    model: str
+    base_url: str
+    api_key: str
+    max_output_tokens: int = 1000
+    timeout_seconds: float = 30.0
+    cooldown_seconds: float = 1.0
+    max_retries: int = 3
+    reasoning_effort: str = "auto"
+    input_tokens_per_minute: int = 0
+    fallback_models: tuple[str, ...] = ()
+    fallback_cooldown_seconds: float = 60.0
+
+    @property
+    def models(self) -> tuple[str, ...]:
+        # The model to call, then the ones to try while it is rate limited
+        return (self.model, *self.fallback_models)
+
+
+@dataclass(frozen=True)
+class PersonaConfig:
+    # The half that never changes, and the half the bot writes. See persona.py.
+    fixed_file: str = "prompt/fixed.txt"
+    persona_file: str = "prompt/persona.txt"
+    self_edit_enabled: bool = False
+    scope: str = "global"
+    max_lines_per_section: int = 20
+    max_line_length: int = 600
+    backup_count: int = 20
+
+
+@dataclass(frozen=True)
+class HistoryConfig:
+    db_file: str = "history.db"
+    token_budget: int = 6000
+    min_messages: int = 12
+    max_messages: int = 50
+
+
+@dataclass(frozen=True)
+class UserMemoryConfig:
+    # Scope comes from [memory], not repeated here
+    enabled: bool = False
+    max_users: int = 100
+    max_facts_per_user: int = 10
+
+
+@dataclass(frozen=True)
+class MemoryConfig:
+    enabled: bool = False
+    scope: str = "global"
+    max_memories: int = 10
+    users: UserMemoryConfig = field(default_factory=UserMemoryConfig)
+
+
+@dataclass(frozen=True)
+class ToolsConfig:
+    enabled: frozenset[str] = frozenset()
+    max_iterations: int = 4
+    max_replies_per_turn: int = 2
+    max_members_listed: int = 50
+    max_channels_listed: int = 40
+
+
+@dataclass(frozen=True)
+class LoggingConfig:
+    level: str = "INFO"
+    file: str = "bot.log"
+    max_bytes: int = 5_000_000
+    backup_count: int = 2
+
+
+@dataclass(frozen=True)
+class Config:
+    discord: DiscordConfig
+    llm: LLMConfig
+    persona: PersonaConfig
+    history: HistoryConfig
+    memory: MemoryConfig
+    tools: ToolsConfig
+    logging: LoggingConfig
+    root: Path = ROOT
+
+    def path(self, relative: str) -> Path:
+        # Resolve a config-supplied path relative to the project directory
+        p = Path(relative).expanduser()
+        return p if p.is_absolute() else self.root / p
+
+
+# ---------------------------------------------------------------------------
+#  .env loading
+# ---------------------------------------------------------------------------
+
+def load_dotenv(path: Path = ENV_FILE) -> None:
+    # Populate os.environ from a .env file, without overriding real env vars
+    if not path.is_file():
+        return
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+# ---------------------------------------------------------------------------
+#  Typed getters — every failure names the exact key that is wrong
+# ---------------------------------------------------------------------------
+
+def _table(data: dict[str, Any], name: str, label: str | None = None) -> dict[str, Any]:
+    # One section of the file. `label` names it in errors when it is nested
+    value = data.get(name, {})
+    if not isinstance(value, dict):
+        raise ConfigError(
+            f"[{label or name}] must be a section, got {type(value).__name__}"
+        )
+    return value
+
+
+def _get(table: dict[str, Any], section: str, key: str, default: Any, kind: type,
+         choices: tuple[str, ...] | None = None, positive: bool = True) -> Any:
+    # Read one key with a type check and a precise error message
+    where = f"[{section}] {key}"
+    if key not in table:
+        return default
+    value = table[key]
+
+    # bool is a subclass of int, so guard both directions explicitly.
+    if kind is not bool and isinstance(value, bool):
+        raise ConfigError(f"{where} must be {kind.__name__}, got a boolean")
+    if kind is float and isinstance(value, int):
+        value = float(value)
+    if not isinstance(value, kind):
+        raise ConfigError(f"{where} must be {kind.__name__}, got {value!r}")
+
+    if choices is not None and value not in choices:
+        raise ConfigError(f"{where} must be one of: {', '.join(choices)} — got {value!r}")
+    if positive and kind in (int, float) and value <= 0:
+        raise ConfigError(f"{where} must be greater than 0, got {value!r}")
+    return value
+
+
+def _require_secret(env_key: str, what: str) -> str:
+    value = os.environ.get(env_key, "").strip()
+    if not value:
+        raise ConfigError(
+            f"{what} is missing. Set {env_key} in your environment or in .env "
+            f"(copy .env.example to .env to get started)."
+        )
+    return value
+
+
+# ---------------------------------------------------------------------------
+#  Loader
+# ---------------------------------------------------------------------------
+
+def load_config(path: Path = CONFIG_FILE) -> Config:
+    load_dotenv(ENV_FILE)
+
+    if not path.is_file():
+        raise ConfigError(f"No config file at {path}. See the README for setup.")
+    try:
+        with path.open("rb") as f:
+            data = tomllib.load(f)
+    except tomllib.TOMLDecodeError as e:
+        raise ConfigError(f"{path.name} is not valid TOML: {e}") from e
+
+    # --- discord ---
+    discord_t = _table(data, "discord")
+    discord_cfg = DiscordConfig(
+        token=_require_secret("DISCORD_TOKEN", "The Discord bot token"),
+        ignore_bots=_get(discord_t, "discord", "ignore_bots", True, bool),
+        allow_dms=_get(discord_t, "discord", "allow_dms", True, bool),
+        max_message_length=_get(discord_t, "discord", "max_message_length", 2000, int),
+        member_intent=_get(discord_t, "discord", "member_intent", False, bool),
+    )
+
+    # --- llm ---
+    llm_t = _table(data, "llm")
+    backend_name = _get(llm_t, "llm", "backend", "gemini", str, tuple(BACKENDS))
+    backend = BACKENDS[backend_name]
+    backend_t = _table(llm_t, backend_name)
+    section = f"llm.{backend_name}"
+
+    base_url = _get(backend_t, section, "base_url", backend.base_url, str)
+    if not base_url:
+        raise ConfigError(f"[{section}] base_url is required for the '{backend_name}' backend.")
+
+    model = _get(backend_t, section, "model", backend.default_model, str).strip()
+    if not model:
+        raise ConfigError(f"[{section}] model cannot be empty.")
+
+    # Drop duplicates, and the primary, from the fallbacks
+    raw_fallbacks = backend_t.get("fallback_models", list(backend.fallbacks))
+    if not isinstance(raw_fallbacks, list) or not all(
+        isinstance(m, str) and m.strip() for m in raw_fallbacks
+    ):
+        raise ConfigError(
+            f"[{section}] fallback_models must be a list of model names, "
+            'e.g. ["gemini-3.5-flash-lite", "gemma-4-26b-a4b-it"] — use [] for none.'
+        )
+    fallbacks: list[str] = []
+    for name in raw_fallbacks:
+        name = name.strip()
+        if name != model and name not in fallbacks:
+            fallbacks.append(name)
+
+    llm_cfg = LLMConfig(
+        backend=backend_name,
+        model=model,
+        base_url=base_url,
+        api_key=_require_secret(backend.env_key, f"The API key for the '{backend_name}' backend"),
+        max_output_tokens=_get(llm_t, "llm", "max_output_tokens", 1000, int),
+        timeout_seconds=_get(llm_t, "llm", "timeout_seconds", 30.0, float),
+        cooldown_seconds=_get(llm_t, "llm", "cooldown_seconds", 1.0, float, positive=False),
+        max_retries=_get(llm_t, "llm", "max_retries", 3, int, positive=False),
+        reasoning_effort=_get(llm_t, "llm", "reasoning_effort", "auto", str, REASONING_LEVELS),
+        input_tokens_per_minute=_get(
+            llm_t, "llm", "input_tokens_per_minute", 0, int, positive=False),
+        fallback_models=tuple(fallbacks),
+        fallback_cooldown_seconds=_get(
+            llm_t, "llm", "fallback_cooldown_seconds", 60.0, float),
+    )
+
+    # --- persona ---
+    persona_t = _table(data, "persona")
+    if "system_prompt_file" in persona_t:
+        raise ConfigError(
+            "[persona] system_prompt_file has been replaced by two keys, because the "
+            "prompt is now two files: fixed_file (which the bot can never change) and "
+            "persona_file (which it can). Set those instead — the defaults are "
+            '"prompt/fixed.txt" and "prompt/persona.txt".'
+        )
+    persona_cfg = PersonaConfig(
+        fixed_file=persona_t.get("fixed_file", "prompt/fixed.txt"),
+        persona_file=persona_t.get("persona_file", "prompt/persona.txt"),
+        self_edit_enabled=_get(persona_t, "persona", "self_edit_enabled", False, bool),
+        scope=_get(persona_t, "persona", "scope", "global", str, PERSONA_SCOPES),
+        max_lines_per_section=_get(persona_t, "persona", "max_lines_per_section", 20, int),
+        max_line_length=_get(persona_t, "persona", "max_line_length", 600, int),
+        backup_count=_get(persona_t, "persona", "backup_count", 20, int, positive=False),
+    )
+    if persona_cfg.self_edit_enabled and not persona_cfg.persona_file:
+        raise ConfigError(
+            "[persona] self_edit_enabled is true but persona_file is empty. "
+            "The bot can only edit sections of a persona it actually has."
         )
 
+    # --- history ---
+    history_t = _table(data, "history")
+    history_cfg = HistoryConfig(
+        db_file=_get(history_t, "history", "db_file", "history.db", str),
+        token_budget=_get(history_t, "history", "token_budget", 6000, int),
+        min_messages=_get(history_t, "history", "min_messages", 12, int),
+        max_messages=_get(history_t, "history", "max_messages", 50, int),
+    )
+    if history_cfg.min_messages > history_cfg.max_messages:
+        raise ConfigError(
+            "[history] min_messages cannot exceed max_messages "
+            f"({history_cfg.min_messages} > {history_cfg.max_messages})."
+        )
 
-# Main backend
-API_BASE_URL, API_KEY, MODEL_ID = _resolve(
-    LLM_BACKEND,
-    LLAMA_BASE_URL, LLAMA_API_KEY, LLAMA_MODEL_ID,
-    GEMINI_API_KEY, GEMINI_MODEL_ID,
-    OPENROUTER_API_KEY, OPENROUTER_MODEL_ID,
-    CEREBRAS_API_KEY, CEREBRAS_MODEL_ID,
-    MISTRAL_API_KEY, MISTRAL_MODEL_ID,
-)
+    # --- memory ---
+    memory_t = _table(data, "memory")
+    users_t = _table(memory_t, "users", "memory.users")
+    memory_cfg = MemoryConfig(
+        enabled=_get(memory_t, "memory", "enabled", False, bool),
+        scope=_get(memory_t, "memory", "scope", "global", str, MEMORY_SCOPES),
+        max_memories=_get(memory_t, "memory", "max_memories", 10, int),
+        users=UserMemoryConfig(
+            enabled=_get(users_t, "memory.users", "enabled", False, bool),
+            max_users=_get(users_t, "memory.users", "max_users", 100, int),
+            max_facts_per_user=_get(
+                users_t, "memory.users", "max_facts_per_user", 10, int),
+        ),
+    )
 
+    # --- tools ---
+    tools_t = _table(data, "tools")
+    enabled_tools = tools_t.get("enabled", [])
+    if not isinstance(enabled_tools, list) or not all(isinstance(t, str) for t in enabled_tools):
+        raise ConfigError('[tools] enabled must be a list of tool names, e.g. ["reply", "react"]')
+    tools_cfg = ToolsConfig(
+        enabled=frozenset(enabled_tools),
+        max_iterations=_get(tools_t, "tools", "max_iterations", 4, int),
+        max_replies_per_turn=_get(tools_t, "tools", "max_replies_per_turn", 2, int),
+        max_members_listed=_get(tools_t, "tools", "max_members_listed", 50, int),
+        max_channels_listed=_get(tools_t, "tools", "max_channels_listed", 40, int),
+    )
+
+    # --- logging ---
+    log_t = _table(data, "logging")
+    log_cfg = LoggingConfig(
+        level=_get(log_t, "logging", "level", "INFO", str, LOG_LEVELS),
+        file=log_t.get("file", "bot.log"),
+        max_bytes=_get(log_t, "logging", "max_bytes", 5_000_000, int),
+        backup_count=_get(log_t, "logging", "backup_count", 2, int, positive=False),
+    )
+
+    return Config(
+        discord=discord_cfg,
+        llm=llm_cfg,
+        persona=persona_cfg,
+        history=history_cfg,
+        memory=memory_cfg,
+        tools=tools_cfg,
+        logging=log_cfg,
+    )
