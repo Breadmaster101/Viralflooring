@@ -183,7 +183,7 @@ def load_dotenv(path: Path = ENV_FILE) -> None:
 
 
 # ---------------------------------------------------------------------------
-#  Typed getters — every failure names the exact key that is wrong
+#  Typed getters: every failure names the exact key that is wrong
 # ---------------------------------------------------------------------------
 
 def _table(data: dict[str, Any], name: str, label: str | None = None) -> dict[str, Any]:
@@ -213,7 +213,7 @@ def _get(table: dict[str, Any], section: str, key: str, default: Any, kind: type
         raise ConfigError(f"{where} must be {kind.__name__}, got {value!r}")
 
     if choices is not None and value not in choices:
-        raise ConfigError(f"{where} must be one of: {', '.join(choices)} — got {value!r}")
+        raise ConfigError(f"{where} must be one of: {', '.join(choices)}, got {value!r}")
     if positive and kind in (int, float) and value <= 0:
         raise ConfigError(f"{where} must be greater than 0, got {value!r}")
     return value
@@ -276,7 +276,7 @@ def load_config(path: Path = CONFIG_FILE) -> Config:
     ):
         raise ConfigError(
             f"[{section}] fallback_models must be a list of model names, "
-            'e.g. ["gemini-3.5-flash-lite", "gemma-4-26b-a4b-it"] — use [] for none.'
+            'e.g. ["gemini-3.5-flash-lite", "gemma-4-26b-a4b-it"], use [] for none.'
         )
     fallbacks: list[str] = []
     for name in raw_fallbacks:
@@ -307,7 +307,7 @@ def load_config(path: Path = CONFIG_FILE) -> Config:
         raise ConfigError(
             "[persona] system_prompt_file has been replaced by two keys, because the "
             "prompt is now two files: fixed_file (which the bot can never change) and "
-            "persona_file (which it can). Set those instead — the defaults are "
+            "persona_file (which it can). Set those instead; the defaults are "
             '"prompt/fixed.txt" and "prompt/persona.txt".'
         )
     persona_cfg = PersonaConfig(

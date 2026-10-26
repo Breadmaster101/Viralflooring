@@ -137,7 +137,7 @@ def split_message(text: str, limit: int = 2000) -> list[str]:
 # ---------------------------------------------------------------------------
 
 NO_NEW_MESSAGES = (
-    "(no new messages since you last spoke — decide whether to say anything else)"
+    "(no new messages since you last spoke; decide whether to say anything else)"
 )
 
 

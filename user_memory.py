@@ -150,7 +150,7 @@ class UserMemoryStore:
             record["name"] = name
 
         if any(_same(existing, fact) for existing in record["facts"]):
-            return False, f"You already remember that about {name} — nothing changed."
+            return False, f"You already remember that about {name}, so nothing changed."
 
         record["facts"].append(fact)
         limit = self.users.max_facts_per_user
@@ -260,7 +260,7 @@ class UserMemoryStore:
         # Prompt block: people present in full, everyone else as a name
         records = self.load(guild_id)
         header = (
-            f"What you remember about specific people, filed under their username — "
+            f"What you remember about specific people, filed under their username, "
             f"notes on {len(records)} of {self.users.max_users} people, up to "
             f"{self.users.max_facts_per_user} things about each:"
         )

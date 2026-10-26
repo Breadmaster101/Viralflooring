@@ -1,7 +1,7 @@
 # Viralflooring
 
 An autonomous Discord bot that decides for itself when to talk. It reads the
-channel, then replies, reacts, remembers things about people, or stays quiet —
+channel, then replies, reacts, remembers things about people, or stays quiet,
 all through tool calls. It can even rewrite its own personality while it runs.
 
 Works with **Google Gemini / Gemma** (free tier), **Mistral** (free tier), or a
@@ -26,7 +26,7 @@ model provider. Setup takes about 10 minutes.
 1. Go to the [Discord Developer Portal](https://discord.com/developers/applications)
    and click **New Application**. Give it a name.
 2. Open the **Bot** tab. Click **Reset Token** and copy the token somewhere
-   safe — this is your `DISCORD_TOKEN`. Anyone with it can control your bot, so
+   safe. This is your `DISCORD_TOKEN`. Anyone with it can control your bot, so
    never share or commit it.
 3. Still on the **Bot** tab, under **Privileged Gateway Intents**, turn on
    **Message Content Intent** and save. The bot will not start without it.
@@ -50,7 +50,7 @@ Pick one. Gemini is the default in `config.toml` and the easiest to start with.
 |---|---|---|---|
 | **Gemini** (free) | [Google AI Studio](https://aistudio.google.com/apikey) | `GEMINI_API_KEY` | `backend = "gemini"` |
 | **Mistral** (free tier) | [Mistral console](https://console.mistral.ai) | `MISTRAL_API_KEY` | `backend = "mistral"` |
-| **Local** | No key needed — run [llama.cpp](https://github.com/ggml-org/llama.cpp)'s `llama-server` with `--jinja` | `LOCAL_API_KEY` (leave as is) | `backend = "local"` |
+| **Local** | No key needed, just run [llama.cpp](https://github.com/ggml-org/llama.cpp)'s `llama-server` with `--jinja` | `LOCAL_API_KEY` (leave as is) | `backend = "local"` |
 
 ### 3. Install and run
 
@@ -222,7 +222,7 @@ has something to add.
 ### Change the persona
 
 The bot's personality lives in [`prompt/persona.txt`](prompt/persona.txt). The
-default is a laid-back chat regular called Viral Flooring — **change it**. Give
+default is a laid-back chat regular called Viral Flooring, so **change it**. Give
 it a new name, a voice, interests, and rules about when to speak.
 
 - Each `## HEADING` is a section. Keep the headings, and write the rules
@@ -323,21 +323,159 @@ environment.
 
 ---
 
+
 ## How it works
 
+### Design
+
+The bot is built on one idea: **give the model as much control over itself as
+possible, and take none of it back through the instructions.**
+
+- **Control is structural.** The system prompt is two files. `prompt/fixed.txt`
+  is the machinery (how tools work, how to read the chat). `prompt/persona.txt`
+  is everything else, and the bot can rewrite it line by line while running.
+  The bot is never told to leave its machinery alone, because the machinery is
+  in a file it cannot write to.
+- **The line is drawn at capability, not obedience.** It can delete its own rule
+  to reply when spoken to, or its rule against leaking the prompt. It cannot
+  break tool calling or lose track of the date.
+- **The fixed half is voice-neutral.** All taste judgments ("be concise", "reply
+  if it's funny") live in the persona file, so a change the bot makes to itself
+  actually takes.
+- **Tool descriptions say what, never when.** How often to react or speak is a
+  line in the persona, which the bot can edit, not a sentence in a schema, which
+  it cannot.
+- **Silence is a real option.** Calling no tools is a normal outcome.
+- **It is told the truth about itself**: what it can do, how far its memory
+  reaches, and whether it can see the full member list.
+
+The trade is deliberate: nothing stops a user talking the bot into rewriting
+itself. The answer to a bad call is `persona_backups/` and `--reset-persona`,
+not a veto.
+
+### How a turn works
+
 Every new message gives the bot one turn. It sees the recent chat and a list of
-tools, and picks: `reply`, `react`, `remember`, `search_history`,
-`edit_system_prompt`, and so on — or nothing at all, which is the most common
-choice in a busy channel.
+tools, and picks one or more, or none (staying quiet, the common case):
 
-The system prompt is split in two. `prompt/fixed.txt` is the machinery the bot
-can't touch. `prompt/persona.txt` is everything about who it is, and the bot can
-rewrite it. Because the machinery is out of reach, no edit can break the bot,
-and `--reset-persona` always gets you back.
+| Tool | What it does |
+|---|---|
+| `reply` / `reply_to` | Send a message, or reply to a specific earlier one |
+| `react` | Add an emoji reaction |
+| `remember` / `forget` | Add or delete a long-term fact |
+| `remember_about_user` / `forget_about_user` | Add or delete a note about one person |
+| `get_user_memories` | Read one person's notes, or list everyone it has notes on |
+| `search_history` | Search older messages in the channel |
+| `set_nickname` / `set_status` | Change its own nickname or status text |
+| `get_server_info` | Look up the server, its channels and members |
+| `edit_system_prompt` | Rewrite part of its own persona |
 
-The full write-up — design philosophy, how the chat is shown to the model, the
-memory system, rate limiting and model fallback, and how self-editing works — is
-in [docs/DESIGN.md](docs/DESIGN.md).
+The chat is shown to the model as a single user turn, with the bot's own past
+lines marked `you:`. Replaying them as assistant turns taught some models
+(Mistral in particular) to answer in prose instead of calling tools.
+
+```
+[17:32] [#4] some_user7281 (nickname: Sam): viral what time is it
+(reactions: 💀 Sam, alice; 🔥 you)
+```
+
+- `[#4]` is a short handle the model passes to `react` or `reply_to`. Raw
+  Discord IDs are 19 digits and models mangle them. Handles are recounted every
+  turn.
+- Only other people's messages carry a timestamp; the bot's own lines are bare,
+  because it copies any pattern it sees in its own past messages. The current
+  date and time are on the last line of the chat.
+- Reactions and edits are recorded when they happen and shown on the next turn.
+  Neither starts a turn on its own.
+- Most turns cost one API call. Tools that return something the model must act
+  on (`get_user_memories`, `search_history`, `get_server_info`,
+  `edit_system_prompt`) need a second one.
+
+### Memory
+
+`[memory]` holds general long-term facts. `[memory.users]` holds notes filed
+under a person's **username** (nicknames change, usernames do not). Only the
+people talking in the current channel have their notes put in the prompt; the
+bot reads anyone else's on demand with `get_user_memories`. When a file or the
+roster is full, the oldest note (or the longest-untouched person) is dropped
+and the bot is told. Scope follows `[memory] scope`. The user-memory tools add
+about 480 input tokens per call; set `[memory.users] enabled = false` to get
+them back.
+
+### Rate limits and fallback
+
+Chat models are metered by input tokens, and every call resends the system
+prompt, tool schemas and history, so a free quota can run out in a few
+messages.
+
+- `[llm] input_tokens_per_minute` makes calls wait for room instead of being
+  rejected. `python bot.py --check` prints what one call costs.
+- `[llm.gemini] fallback_models` lists models to use while the preferred one is
+  rate limited. A model that returns a 429 is set aside for as long as the
+  provider asks (or `fallback_cooldown_seconds`), and the preferred model is
+  tried first again on every call. The chain only waits if every model is
+  limited and the first to recover is sooner than `timeout_seconds`.
+- `[llm] reasoning_effort = "auto"` should be left alone. On Gemini it decides
+  whether tools get called at all: `gemma-4-31b-it` answered in prose instead of
+  calling a tool 11 times out of 11 at its own default, and `"none"` is dropped
+  on Gemini 3.x models, which puts it back on that default.
+
+### The persona and self-editing
+
+`prompt/persona.txt` is the seed and is never written to. The bot's own edits
+live in `persona/` (keyed by section title), with backups in `persona_backups/`.
+Four placeholders are filled in at runtime: `{name}`, `{model}`,
+`{memory_scope}` and `{persona_scope}`. They stay constant while the bot is in a
+channel so the provider's prompt cache keeps working. Set `persona_file` to `""`
+to run without a persona.
+
+With `[persona] self_edit_enabled = true`, the bot edits itself through
+`edit_system_prompt`, and edits apply on the next message. Each editable line is
+shown with a handle like `[#7]`:
+
+```json
+[{"op": "replace", "target": "6", "text": "**Tone:** Relaxed and dry."},
+ {"op": "remove",  "target": "7, 9"},
+ {"op": "add",     "target": "OVERRIDE TRIGGERS",
+                   "text":   "Someone says \"beans\" | Recite the beans creed."}]
+```
+
+- `remove` and `replace` take one number or several (several lines collapse into
+  one new line). For `add`, `target` is a position, or a heading to append
+  under. Quoting a line word for word also works.
+- Handles are resolved against the numbering the model saw, so edits in one
+  batch cannot shift each other.
+- A batch is all or nothing, and the report lists every problem at once. Edits
+  are refused only if they cannot be carried out (bad number, wrong table cell
+  count, a line over `max_line_length`); style is asked for, never enforced.
+- Only `persona.txt` sections are editable: `GROUND RULES`,
+  `CORE IDENTITY & LORE`, `DEFAULT COMMUNICATION STYLE`, `OVERRIDE TRIGGERS`,
+  `WHO A MESSAGE IS AIMED AT`, `WHEN TO SPEAK` and `HOW TO ANSWER`. A new `##`
+  section with contiguous bullets or table rows becomes editable automatically.
+  Prose between two bullet lists makes a section read-only.
+- If you edit `fixed.txt`, keep taste out of it.
+
+### Project structure
+
+```
+bot.py           entry point and argument parsing
+config.py        typed config loading and validation
+config.toml      all settings, commented
+.env             secrets (gitignored)
+bot_client.py    Discord client and the tool-calling loop
+tools.py         tool definitions and dispatch
+llm.py           model client, rate limiting, model fallback
+database.py      SQLite conversation history and reactions
+memory.py        long-term memory store
+user_memory.py   long-term memory filed under a person
+persona.py       system prompt: the fixed half and the editable half
+utils.py         logging, message splitting, history formatting
+console.py       cross-platform raw keyboard input
+troll.py         troll mode worker
+prompt/          fixed.txt (bot cannot change) and persona.txt (it can)
+```
+
+### Privacy
 
 Chat history (`history.db`), memories, the bot's persona edits and your `.env`
 are stored only on the machine running the bot, and are all gitignored. The only

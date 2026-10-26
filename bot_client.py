@@ -131,7 +131,7 @@ class ViralBot(discord.Client):
         if not store.editable:
             log.warning(
                 "[persona] self_edit_enabled is true, but %s has no editable "
-                "sections — it needs at least one '## TITLE' section whose body "
+                "sections: it needs at least one '## TITLE' section whose body "
                 "is a bullet list or a table. Self-editing is off.",
                 self.cfg.persona.persona_file,
             )
@@ -191,23 +191,23 @@ class ViralBot(discord.Client):
     def _memory_scope(self, guild: discord.Guild | None) -> str:
         # States how far memory reaches, since the bot gets asked and would guess
         if self.memory is None:
-            return "off — you remember nothing once a conversation scrolls out of view"
+            return "off: you remember nothing once a conversation scrolls out of view"
         if self.cfg.memory.scope != "per_server":
-            return "shared — the same memories everywhere you are, servers and DMs alike"
+            return "shared: the same memories everywhere you are, servers and DMs alike"
         if guild is None:
             return (
                 "kept per server, but direct messages share one memory between them; "
                 "what you remember here is not what you remember in any server"
             )
         return (
-            f"kept per server — these are your memories of {guild.name} only, and you "
+            f"kept per server: these are your memories of {guild.name} only, and you "
             f"have separate ones elsewhere"
         )
 
     def _persona_scope(self, guild: discord.Guild | None) -> str:
         # Describe how far a change to its own system prompt would reach
         if self.persona_store is None:
-            return "fixed — you cannot change it"
+            return "fixed: you cannot change it"
         if self.cfg.persona.scope != "per_server":
             return "yours to change, and a change applies everywhere you are"
         if guild is None:
@@ -216,7 +216,7 @@ class ViralBot(discord.Client):
                 "the one each server has"
             )
         return (
-            f"yours to change, but only here — this version is {guild.name}'s, and "
+            f"yours to change, but only here: this version is {guild.name}'s, and "
             f"other servers keep their own"
         )
 
@@ -274,7 +274,7 @@ class ViralBot(discord.Client):
         )
         history, refs, oldest_ts = build_history(rows, reactions)
         if not history:
-            log.warning("[#%s] No usable history (%d rows) — skipping turn.", channel_name, len(rows))
+            log.warning("[#%s] No usable history (%d rows), skipping turn.", channel_name, len(rows))
             return
 
         # Every name in the chat for the tools, and one entry per person for the prompt

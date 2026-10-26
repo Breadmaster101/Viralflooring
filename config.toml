@@ -1,5 +1,5 @@
 # ============================================================================
-#  Viralflooring — configuration
+#  Viralflooring: configuration
 #
 #  Secrets live in .env, not here. Copy .env.example to .env and fill it in.
 # ============================================================================
@@ -15,7 +15,7 @@ max_message_length = 2000
 # Request the Server Members privileged intent, so get_server_info can list the
 # full member roster. Also needs "Server Members Intent" enabled at
 # https://discord.com/developers/applications (Bot > Privileged Gateway
-# Intents) — on here but off there and the bot will not start.
+# Intents). On here but off there and the bot will not start.
 member_intent = false
 
 
@@ -54,7 +54,7 @@ max_retries = 3
 input_tokens_per_minute = 15000
 
 # How long to leave a rate-limited model alone when the provider does not name
-# a delay itself. Only decides when the preferred model is retried — nothing
+# a delay itself. Only decides when the preferred model is retried; nothing
 # waits this out while another model in the chain is free.
 fallback_cooldown_seconds = 60.0
 
@@ -91,7 +91,7 @@ fallback_models = [
 model = "ministral-14b-latest"
 
 # All free-tier and function-calling, in descending order of capability.
-# Measured request limits: 14b 30/min, 8b 188/min, 3b 750/min — so the chain
+# Measured request limits: 14b 30/min, 8b 188/min, 3b 750/min, so the chain
 # also widens as it goes down, and a fallback can absorb a burst 14b cannot.
 fallback_models = [
     "ministral-8b-latest",
@@ -103,7 +103,7 @@ fallback_models = [
 # The system prompt is two files, so what the bot can and cannot change is
 # obvious from where it lives:
 #
-#   fixed_file    never changes — how tools are called, how to read the chat,
+#   fixed_file    never changes: how tools are called, how to read the chat,
 #                 and what the bot is told about its situation. Holds a
 #                 {persona} marker showing where the other file is dropped in.
 #   persona_file  who it is, when it speaks, and what it will not do, the rule
@@ -122,7 +122,7 @@ persona_file = "prompt/persona.txt"
 
 # Let the bot rewrite persona_file's sections through the edit_system_prompt
 # tool. Everything in fixed_file stays out of reach, so no edit can stop the
-# bot working, and neither file is written to — persona_file is the seed, and
+# bot working, and neither file is written to: persona_file is the seed, and
 # `python bot.py --reset-persona` restores it. A batch of edits either all
 # applies or none of it does.
 #
@@ -130,7 +130,7 @@ persona_file = "prompt/persona.txt"
 # off, or drop edit_system_prompt from [tools] enabled.
 self_edit_enabled = true
 
-# "global" — one persona everywhere. "per_server" — one per server, each
+# "global": one persona everywhere. "per_server": one per server, each
 # seeded from persona_file.
 scope = "per_server"
 
@@ -158,7 +158,7 @@ max_messages = 50
 # Long-term facts the bot chooses to remember about people. The memory list is
 # always put in the system prompt.
 enabled = true
-# "global" — one shared memory file. "per_server" — one per guild.
+# "global": one shared memory file. "per_server": one per guild.
 scope = "per_server"
 # Maximum facts stored; oldest are dropped at the limit. The bot is told this
 # number and how many it is using.
@@ -173,7 +173,7 @@ max_memories = 50
 # is a name on a roster the bot reads with get_user_memories, so knowing fifty
 # people costs fifty people's tokens only when they turn up.
 #
-# Scope follows [memory] scope. Requires [memory] enabled — when that is off,
+# Scope follows [memory] scope. Requires [memory] enabled; when that is off,
 # the three per-person tools are not offered at all, whatever [tools] says.
 enabled = true
 

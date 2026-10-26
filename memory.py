@@ -61,7 +61,7 @@ class MemoryStore:
 
         memories = self.load(guild_id)
         if any(m.strip().lower() == fact.lower() for m in memories):
-            return False, "Already remembered — nothing changed."
+            return False, "Already remembered, nothing changed."
 
         memories.append(fact)
         dropped = ""
@@ -96,7 +96,7 @@ class MemoryStore:
         memories = self.load(guild_id)
         limit = self.cfg.max_memories
         header = (
-            f"Things you have chosen to remember — you hold {len(memories)} of "
+            f"Things you have chosen to remember. You hold {len(memories)} of "
             f"{limit}, and once full, saving another drops the oldest:"
         )
         if not memories:

@@ -43,7 +43,7 @@ def _read_prompt(cfg: Config, which: str):
     # Returns (path, text, problem); problem is empty when the file was read
     filename = getattr(cfg.persona, which)
     if not filename:
-        return None, "", f"not configured — [persona] {which} is empty"
+        return None, "", f"not configured: [persona] {which} is empty"
 
     path = cfg.path(filename)
     try:
@@ -104,7 +104,7 @@ def check_config(cfg: Config) -> int:
         if not problem:
             print(f"{label}: {path.name}")
         else:
-            print(f"{label}: {f'{path} — ' if path else ''}{problem}")
+            print(f"{label}: {f'{path}: ' if path else ''}{problem}")
 
     # Prompt, tool schemas and history are all resent on every call
     from llm import estimate_tokens
@@ -145,7 +145,7 @@ def check_config(cfg: Config) -> int:
     }.get(cfg.llm.backend, "which may or may not be cached, depending on the backend")
     print(
         f"  of which ~{fixed_cost} is a stable prefix (the system prompt, then "
-        f"the tool schemas), byte-identical from call to call — {cache_note}. "
+        f"the tool schemas), byte-identical from call to call: {cache_note}. "
         f"The chat sits after it, the clock with it, and those change every call"
     )
     if "{date}" in f"{fixed_text or ''}{persona_text or ''}":
@@ -160,7 +160,7 @@ def check_config(cfg: Config) -> int:
         print("Persona self-editing: off")
     elif not editable:
         print(
-            "Persona self-editing: off — the persona file has no editable sections. "
+            "Persona self-editing: off: the persona file has no editable sections. "
             "It needs at least one '## TITLE' whose body is a bullet list or a table"
         )
     else:

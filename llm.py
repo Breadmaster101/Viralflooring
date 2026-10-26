@@ -500,7 +500,7 @@ class LLMClient:
             if delay > self.cfg.timeout_seconds:
                 log.error(
                     "[%s] Every model is set aside, and the first one back (%s) "
-                    "is %.0fs away — longer than [llm] timeout_seconds.",
+                    "is %.0fs away, longer than [llm] timeout_seconds.",
                     label, model, delay,
                 )
                 raise limited or RuntimeError(

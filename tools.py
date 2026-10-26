@@ -394,7 +394,7 @@ async def tool_get_server_info(ctx: TurnContext) -> str:
 
     if not complete:
         lines.append(
-            f"Members: {total} in total, and you cannot see who they are — only the "
+            f"Members: {total} in total, and you cannot see who they are, only the "
             f"{shown} you have come across recently. You do not know the other "
             f"{unknown}" + (f". The ones you know: {named}." if people else ".")
         )
@@ -499,7 +499,7 @@ ALL_TOOLS: dict[str, Tool] = {
             description=(
                 "Add a single emoji reaction to a message. A reaction with no reply "
                 "is a complete response on its own. How often you react, and what "
-                "you react to, is your own style — see your system prompt."
+                "you react to, is your own style, see your system prompt."
             ),
             parameters=_params(
                 {
@@ -519,7 +519,7 @@ ALL_TOOLS: dict[str, Tool] = {
         Tool(
             name="remember",
             description=(
-                "Store one long-term fact that is not about one particular person — "
+                "Store one long-term fact that is not about one particular person, "
                 "something about a place, a group, a running joke, or the world. "
                 "Anything about a specific person goes under them with "
                 "remember_about_user instead. Be extremely selective: only things "
@@ -560,7 +560,7 @@ ALL_TOOLS: dict[str, Tool] = {
                     "username": {
                         "type": "string",
                         "description": (
-                            "Whose it is. Use their username — the name before the "
+                            "Whose it is. Use their username, the name before the "
                             "colon in the chat, not their nickname, which changes."
                         ),
                     },
@@ -677,7 +677,7 @@ ALL_TOOLS: dict[str, Tool] = {
         Tool(
             name="edit_system_prompt",
             description=(
-                "Change your own system prompt — the document that defines who you "
+                "Change your own system prompt, the document that defines who you "
                 "are. Lines are addressed by the number in front of them. Any number "
                 "of lines can be added, removed, and rewritten in one call, anywhere "
                 "in the part of the document that is yours; the machinery above that "
@@ -718,7 +718,7 @@ ALL_TOOLS: dict[str, Tool] = {
                                         "For add and replace, the new line. Write it "
                                         "in full sentences with correct spelling, "
                                         "grammar and punctuation, however casually you "
-                                        "talk in chat — this is a written document, "
+                                        "talk in chat; this is a written document, "
                                         "not a message. Match the formatting of the "
                                         "lines around it: the same **Bold label:** "
                                         "opening where they use one, and the same "
@@ -772,7 +772,7 @@ def select_tools(enabled: frozenset[str], memory_enabled: bool,
         selected[name] = ALL_TOOLS[name]
 
     if "reply" not in selected:
-        log.warning("The 'reply' tool is not enabled — the bot will never speak.")
+        log.warning("The 'reply' tool is not enabled, so the bot will never speak.")
     return selected
 
 
