@@ -1,7 +1,8 @@
 # Talking to the model: an OpenAI-compatible client with rate limiting,
 # reasoning-effort resolution, and backend-agnostic tool calls.
 # Rate limits are handled here (not by the SDK) because Gemini reports the wait
-# in the error body.
+# in the error body. SDK retries only apply to the last model left in the chain;
+# before that, a failing model is skipped at once since the next one is free.
 
 from __future__ import annotations
 
@@ -123,12 +124,17 @@ class RateLimiter:
 class ModelRotation:
     # Picks the model to call. A rate-limited model is set aside for as long as
     # the provider asked; the chain is walked from the top, so the preferred
-    # model returns on its own.
+    # model returns on its own. A model that keeps failing is set aside for
+    # longer each time, so it is not retried on every message while it is down.
+
+    MAX_BENCH_SECONDS = 900.0
 
     def __init__(self, models: Sequence[str], cooldown: float):
         self.models = list(dict.fromkeys(m for m in models if m))
         self.cooldown = max(1.0, cooldown)
         self._until: dict[str, float] = {}
+        # Failures in a row per model, cleared by a success
+        self._strikes: dict[str, int] = {}
 
     def usable(self) -> list[str]:
         # The chain in order, minus whatever is still counting down
@@ -145,6 +151,14 @@ class ModelRotation:
 
     def bench(self, model: str, seconds: float, label: str = "turn",
               reason: str = "rate limited") -> None:
+        strikes = self._strikes.get(model, 0) + 1
+        self._strikes[model] = strikes
+        if strikes > 1:
+            # Exponential backoff from the second failure in a row: the provider's
+            # retryDelay only covers its per-minute window, and an overloaded
+            # model (500/503) fails again as soon as it is back
+            seconds = max(seconds, min(
+                self.cooldown * 2 ** (strikes - 2), self.MAX_BENCH_SECONDS))
         # Floor of one second
         seconds = max(1.0, seconds)
         self._until[model] = time.monotonic() + seconds
@@ -163,6 +177,9 @@ class ModelRotation:
 
     def clear(self, model: str) -> None:
         self._until.pop(model, None)
+
+    def succeeded(self, model: str) -> None:
+        self._strikes.pop(model, None)
 
 
 # Gemini puts the wait in the error body, not a Retry-After header
@@ -375,6 +392,9 @@ class LLMClient:
             timeout=cfg.timeout_seconds,
             max_retries=cfg.max_retries,
         )
+        # For when another model could take the call instead: SDK retries all hit
+        # the same model, costing up to a timeout each before the chain moves on
+        self.no_retry_client = self.client.with_options(max_retries=0)
 
     async def aclose(self) -> None:
         await self.client.close()
@@ -398,12 +418,12 @@ class LLMClient:
 
     async def _call(
         self, model: str, request: dict[str, Any], estimated: int, label: str,
-        system_for: Callable[[str], str] | None = None,
+        system_for: Callable[[str], str] | None = None, retry: bool = True,
     ):
         request = self._retarget(model, request, system_for)
         keep = keeps_thought_signatures(self.cfg.backend, model)
         try:
-            return await self._post(model, request, estimated, label, keep)
+            return await self._post(model, request, estimated, label, keep, retry)
         except openai.BadRequestError as e:
             # The name-based rule can guess wrong; retry once with the other treatment
             if not (is_signature_complaint(e) and has_tool_call_extras(request["messages"])):
@@ -414,11 +434,11 @@ class LLMClient:
                 label, model, "with" if keep else "without",
                 "without" if keep else "with",
             )
-            return await self._post(model, request, estimated, label, not keep)
+            return await self._post(model, request, estimated, label, not keep, retry)
 
     async def _post(
         self, model: str, request: dict[str, Any], estimated: int, label: str,
-        keep_signatures: bool,
+        keep_signatures: bool, retry: bool = True,
     ):
         kwargs = dict(request, model=model)
         if not keep_signatures:
@@ -435,7 +455,8 @@ class LLMClient:
             len(request["messages"]), len(request.get("tools") or []), estimated,
         )
         started = time.monotonic()
-        completion = await self.client.chat.completions.create(**kwargs)
+        client = self.client if retry else self.no_retry_client
+        completion = await client.chat.completions.create(**kwargs)
         # Timed so slow turns can be attributed
         log.info("[%s] <- %s in %.1fs", label, model, time.monotonic() - started)
         return completion
@@ -448,8 +469,8 @@ class LLMClient:
         label: str = "turn",
         system_for: Callable[[str], str] | None = None,
     ) -> ModelReply:
-        # Runs one completion, walking the model chain: a 429 benches that model
-        # and the next is tried. system_for renders the system prompt (which names
+        # Runs one completion, walking the model chain: a 429, 5xx or stall benches
+        # that model and the next is tried. system_for renders the system prompt (which names
         # the model) for whichever model is called, keeping each prompt cache-stable.
         request: dict[str, Any] = {
             "messages": messages,
@@ -468,14 +489,18 @@ class LLMClient:
         order = ready or sorted(usable, key=lambda m: self.limiter.delay_for(m, estimated))
 
         limited: openai.RateLimitError | None = None
-        stalled: openai.APIConnectionError | None = None
+        stalled: openai.APIError | None = None
         completion = None
-        for model in order:
+        for i, model in enumerate(order):
+            # Only the last model standing gets SDK retries
+            last = i == len(order) - 1
             try:
-                completion = await self._call(model, request, estimated, label, system_for)
+                completion = await self._call(
+                    model, request, estimated, label, system_for, retry=last)
+                self.rotation.succeeded(model)
                 break
             except openai.RateLimitError as e:
-                # SDK retries are exhausted, so bench the model for the requested time
+                # Bench the model for the time the provider asked for
                 limited = e
                 self.rotation.bench(model, retry_after(e) or self.rotation.cooldown, label)
             except openai.APIConnectionError as e:
@@ -485,6 +510,15 @@ class LLMClient:
                     model, self.cfg.timeout_seconds, label,
                     "not responding" if isinstance(e, openai.APITimeoutError)
                     else "unreachable",
+                )
+            except openai.APIStatusError as e:
+                # 500/503: overloaded on the provider's side, so move on
+                if e.status_code < 500:
+                    raise
+                stalled = e
+                self.rotation.bench(
+                    model, self.cfg.timeout_seconds, label,
+                    f"failing (HTTP {e.status_code})",
                 )
 
         if completion is None and stalled is not None and limited is None:
@@ -513,6 +547,7 @@ class LLMClient:
             await asyncio.sleep(delay)
             self.rotation.clear(model)
             completion = await self._call(model, request, estimated, label, system_for)
+            self.rotation.succeeded(model)
 
         if not completion.choices:
             log.warning("[%s] Model returned no choices", label)

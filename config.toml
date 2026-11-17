@@ -38,7 +38,9 @@ timeout_seconds = 12.0
 # holding that line.
 cooldown_seconds = 2.0
 
-# Retries on 429s, 5xx and connection errors, handled by the OpenAI SDK.
+# Retries on 429s, 5xx and connection errors, handled by the OpenAI SDK. Only
+# used on the last model left in the chain: while a fallback is free, a failing
+# model is skipped straight away instead of retried.
 max_retries = 3
 
 # Input tokens allowed per minute, or 0 for no limit. Calls wait for room
