@@ -65,6 +65,15 @@ def check_config(cfg: Config) -> int:
             f"or {cfg.llm.fallback_cooldown_seconds:.0f}s if it does not say)"
         )
 
+    whitelist = cfg.discord.channel_whitelist
+    if whitelist:
+        print(f"Channel whitelist: {len(whitelist)} server(s) limited, every other server unrestricted")
+        for guild_id, channels in whitelist.items():
+            listed = ", ".join(str(c) for c in sorted(channels)) or "none (silent there)"
+            print(f"  server {guild_id}: {listed}")
+    else:
+        print("Channel whitelist: off (every channel in every server)")
+
     fixed_path, fixed_text, fixed_problem = _read_prompt(cfg, "fixed_file")
     persona_path, persona_text, persona_problem = _read_prompt(cfg, "persona_file")
     # Parsing only; constructing the store touches no files.

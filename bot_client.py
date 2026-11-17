@@ -305,6 +305,9 @@ class ViralBot(discord.Client):
             max_replies=self.cfg.tools.max_replies_per_turn,
             max_members_listed=self.cfg.tools.max_members_listed,
             max_channels_listed=self.cfg.tools.max_channels_listed,
+            allowed_channels=(
+                self.cfg.discord.channel_whitelist.get(guild.id) if guild else None
+            ),
             message_refs=refs,
             chat_users=participants,
             oldest_visible_ts=oldest_ts,
@@ -420,6 +423,10 @@ class ViralBot(discord.Client):
             return
         if message.guild is None and not self.cfg.discord.allow_dms:
             return
+        if not self._channel_allowed(
+            message.guild.id if message.guild else None, message.channel.id, message.channel,
+        ):
+            return
 
         content = self._describe(message)
         author = self._author_name(message.author)
@@ -468,6 +475,8 @@ class ViralBot(discord.Client):
         # only fires for cached messages (none after a restart).
         if self.db is None or self.user is None:
             return
+        if not self._channel_allowed(payload.guild_id, payload.channel_id):
+            return
 
         reactor = payload.member
         if reactor is not None and reactor.bot and reactor.id != self.user.id:
@@ -497,6 +506,15 @@ class ViralBot(discord.Client):
         if self.db is None:
             return
         await remove_reaction(self.db, payload.message_id, str(payload.emoji), payload.user_id)
+
+    def _channel_allowed(self, guild_id: int | None, channel_id: int,
+                         channel: Any = None) -> bool:
+        # [discord] channel_whitelist; a thread counts as the channel it is in
+        if channel is None:
+            channel = self.get_channel(channel_id)
+        if isinstance(channel, discord.Thread) and channel.parent_id:
+            channel_id = channel.parent_id
+        return self.cfg.discord.allows(guild_id, channel_id)
 
     def _channel_name(self, channel_id: int) -> str:
         channel = self.get_channel(channel_id)

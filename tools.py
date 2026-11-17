@@ -49,6 +49,8 @@ class TurnContext:
     max_replies: int
     max_members_listed: int = 50
     max_channels_listed: int = 40
+    # [discord] channel_whitelist for this server; None means every channel
+    allowed_channels: frozenset[int] | None = None
     # Short handles ("1", "2", ...) shown in the prompt -> real Discord message IDs.
     message_refs: dict[str, int] = field(default_factory=dict)
     # Every name the people in this conversation go by, folded -> username.
@@ -369,11 +371,16 @@ async def tool_get_server_info(ctx: TurnContext) -> str:
         c for c in guild.text_channels
         if guild.me is None or c.permissions_for(guild.me).view_channel
     ]
+    label = "Channels"
+    if ctx.allowed_channels is not None:
+        # The rest are ignored entirely, so only list where it can take part
+        visible = [c for c in visible if c.id in ctx.allowed_channels]
+        label = "Channels you take part in (you cannot see or speak in the others)"
     if visible:
         names = ", ".join(f"#{c.name}" for c in visible[:ctx.max_channels_listed])
         more = len(visible) - ctx.max_channels_listed
         lines.append(
-            f"Channels ({len(visible)}): {names}" + (f", and {more} more" if more > 0 else "")
+            f"{label} ({len(visible)}): {names}" + (f", and {more} more" if more > 0 else "")
         )
 
     total = guild.member_count or len(guild.members)

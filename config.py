@@ -68,6 +68,16 @@ class DiscordConfig:
     allow_dms: bool = True
     max_message_length: int = 2000
     member_intent: bool = False
+    # Server ID -> the only channel IDs the bot takes part in there. Servers
+    # not listed are unrestricted.
+    channel_whitelist: dict[int, frozenset[int]] = field(default_factory=dict)
+
+    def allows(self, guild_id: int | None, channel_id: int) -> bool:
+        # DMs are governed by allow_dms, not the whitelist
+        if guild_id is None:
+            return True
+        allowed = self.channel_whitelist.get(guild_id)
+        return allowed is None or channel_id in allowed
 
 
 @dataclass(frozen=True)
@@ -219,6 +229,38 @@ def _get(table: dict[str, Any], section: str, key: str, default: Any, kind: type
     return value
 
 
+def _discord_id(value: Any) -> int | None:
+    # A Discord ID as written in TOML: an integer, or digits in a string
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
+def _channel_whitelist(discord_t: dict[str, Any]) -> dict[int, frozenset[int]]:
+    table = _table(discord_t, "channel_whitelist", "discord.channel_whitelist")
+    whitelist: dict[int, frozenset[int]] = {}
+    for key, channels in table.items():
+        guild_id = _discord_id(key)
+        if guild_id is None:
+            raise ConfigError(
+                f"[discord.channel_whitelist] keys must be server IDs, got {key!r}"
+            )
+        if not isinstance(channels, list):
+            channels = [channels]
+        ids = [_discord_id(c) for c in channels]
+        if any(i is None for i in ids):
+            raise ConfigError(
+                f"[discord.channel_whitelist] {key} must be a list of channel IDs, "
+                f"e.g. [987654321098765432], got {channels!r}"
+            )
+        whitelist[guild_id] = frozenset(ids)
+    return whitelist
+
+
 def _require_secret(env_key: str, what: str) -> str:
     value = os.environ.get(env_key, "").strip()
     if not value:
@@ -252,6 +294,7 @@ def load_config(path: Path = CONFIG_FILE) -> Config:
         allow_dms=_get(discord_t, "discord", "allow_dms", True, bool),
         max_message_length=_get(discord_t, "discord", "max_message_length", 2000, int),
         member_intent=_get(discord_t, "discord", "member_intent", False, bool),
+        channel_whitelist=_channel_whitelist(discord_t),
     )
 
     # --- llm ---

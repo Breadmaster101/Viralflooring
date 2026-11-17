@@ -19,6 +19,18 @@ max_message_length = 2000
 member_intent = false
 
 
+[discord.channel_whitelist]
+# Limit the bot to certain channels in a server: server ID = [channel IDs].
+# Servers not listed here are unrestricted. In a listed server, every other
+# channel is ignored completely: nothing is read, stored, logged or answered.
+# Threads follow the channel they were started in. [] keeps it silent there.
+#
+# Get IDs with Discord's Developer Mode on (Settings > Advanced), then
+# right-click the server icon or the channel > Copy ID.
+#
+# 123456789012345678 = [987654321098765432]
+
+
 [llm]
 # Backend to talk to: "local" (llama.cpp or any OpenAI-compatible server),
 # "gemini", or "mistral". Only the matching [llm.*] table below is used.
@@ -74,14 +86,17 @@ base_url = "http://127.0.0.1:8080/v1"
 model = "default"
 
 [llm.gemini]
-model = "gemma-4-31b-it"
+# gemma-4-31b-it was the primary, but on the free tier it failed most calls
+# (429/500/503) and often took 15s+ when it did answer; flash-lite answers in
+# about a second.
+model = "gemini-3.5-flash-lite"
 
 # Models to try, in order, while `model` is rate limited. Gemini counts free
 # quota per model, so a 429 on one says nothing about the next. The chain is
 # always tried from the top, so `model` resumes on its own. [] turns it off.
 fallback_models = [
-    "gemini-3.5-flash-lite",
     "gemini-3.1-flash-lite",
+    "gemma-4-31b-it",
     "gemma-4-26b-a4b-it",
 ]
 
