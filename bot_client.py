@@ -320,6 +320,9 @@ class ViralBot(discord.Client):
             allowed_channels=(
                 self.cfg.discord.channel_whitelist.get(guild.id) if guild else None
             ),
+            typing_min_seconds=self.cfg.discord.typing_min_seconds,
+            typing_seconds_per_char=self.cfg.discord.typing_seconds_per_char,
+            typing_max_seconds=self.cfg.discord.typing_max_seconds,
             message_refs=refs,
             chat_users=participants,
             oldest_visible_ts=oldest_ts,

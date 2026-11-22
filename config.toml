@@ -26,6 +26,14 @@ batch_window_seconds = 2.0
 # ...but never hold a reply back longer than this while people keep talking.
 batch_max_wait_seconds = 8.0
 
+# Once the model has decided to reply, show "typing..." for a moment before
+# sending, scaled to the reply's length: min + per_char x characters, capped at
+# max. Happens after the API call, so it costs no quota. typing_max_seconds = 0
+# sends straight away.
+typing_min_seconds = 0.5
+typing_seconds_per_char = 0.02
+typing_max_seconds = 2.5
+
 
 [discord.channel_whitelist]
 # Limit the bot to certain channels in a server: server ID = [channel IDs].

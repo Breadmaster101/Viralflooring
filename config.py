@@ -72,6 +72,11 @@ class DiscordConfig:
     # messages is answered in one turn. 0 disables the wait.
     batch_window_seconds: float = 2.0
     batch_max_wait_seconds: float = 8.0
+    # Show typing before each reply for min + per_char * length, capped at max
+    # seconds, so replies do not appear instantly. max = 0 turns it off.
+    typing_min_seconds: float = 0.5
+    typing_seconds_per_char: float = 0.02
+    typing_max_seconds: float = 2.5
     # Server ID -> the only channel IDs the bot takes part in there. Servers
     # not listed are unrestricted.
     channel_whitelist: dict[int, frozenset[int]] = field(default_factory=dict)
@@ -302,6 +307,12 @@ def load_config(path: Path = CONFIG_FILE) -> Config:
             discord_t, "discord", "batch_window_seconds", 2.0, float, positive=False),
         batch_max_wait_seconds=_get(
             discord_t, "discord", "batch_max_wait_seconds", 8.0, float, positive=False),
+        typing_min_seconds=_get(
+            discord_t, "discord", "typing_min_seconds", 0.5, float, positive=False),
+        typing_seconds_per_char=_get(
+            discord_t, "discord", "typing_seconds_per_char", 0.02, float, positive=False),
+        typing_max_seconds=_get(
+            discord_t, "discord", "typing_max_seconds", 2.5, float, positive=False),
         channel_whitelist=_channel_whitelist(discord_t),
     )
 

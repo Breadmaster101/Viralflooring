@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import logging
 import re
@@ -18,7 +20,7 @@ from database import search_history as db_search_history
 from memory import MemoryStore
 from persona import Edit, PersonaStore
 from user_memory import UserMemoryStore
-from utils import split_display_name, split_message, strip_transcript_stamp
+from utils import safe_typing, split_display_name, split_message, strip_transcript_stamp
 
 log = logging.getLogger(__name__)
 
@@ -51,6 +53,10 @@ class TurnContext:
     max_channels_listed: int = 40
     # [discord] channel_whitelist for this server; None means every channel
     allowed_channels: frozenset[int] | None = None
+    # [discord] typing_* settings; max 0 means no typing pause before a reply
+    typing_min_seconds: float = 0.0
+    typing_seconds_per_char: float = 0.0
+    typing_max_seconds: float = 0.0
     # Short handles ("1", "2", ...) shown in the prompt -> real Discord message IDs.
     message_refs: dict[str, int] = field(default_factory=dict)
     # Every name the people in this conversation go by, folded -> username.
@@ -121,6 +127,16 @@ def _params(properties: dict[str, Any], required: list[str]) -> dict[str, Any]:
 
 # --- reply -----------------------------------------------------------------
 
+def typing_delay(ctx: TurnContext, text: str) -> float:
+    # Seconds of "typing..." before sending: longer replies take a little longer
+    if ctx.typing_max_seconds <= 0:
+        return 0.0
+    return min(
+        ctx.typing_max_seconds,
+        ctx.typing_min_seconds + ctx.typing_seconds_per_char * len(text),
+    )
+
+
 async def _send(ctx: TurnContext, text: str,
                 reference: discord.PartialMessage | None = None) -> str:
     if ctx.replies_sent >= ctx.max_replies:
@@ -142,14 +158,20 @@ async def _send(ctx: TurnContext, text: str,
 
     chunks = split_message(text, ctx.max_message_length)
     sent: discord.Message | None = None
-    for index, chunk in enumerate(chunks):
-        # Only the first chunk carries the reply reference
-        kwargs: dict[str, Any] = {}
-        if reference is not None and index == 0:
-            kwargs["reference"] = reference
-            # Do not ping on a reply
-            kwargs["mention_author"] = False
-        sent = await ctx.channel.send(chunk, **kwargs)
+    delay = typing_delay(ctx, text)
+    # Typing shown for a moment first, so the reply does not land the instant
+    # the API answers; sending inside the block ends the indicator cleanly
+    async with safe_typing(ctx.channel) if delay > 0 else contextlib.nullcontext():
+        if delay > 0:
+            await asyncio.sleep(delay)
+        for index, chunk in enumerate(chunks):
+            # Only the first chunk carries the reply reference
+            kwargs: dict[str, Any] = {}
+            if reference is not None and index == 0:
+                kwargs["reference"] = reference
+                # Do not ping on a reply
+                kwargs["mention_author"] = False
+            sent = await ctx.channel.send(chunk, **kwargs)
 
     ctx.replies_sent += 1
     ctx.acted = True
