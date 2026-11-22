@@ -163,6 +163,7 @@ async def _send(ctx: TurnContext, text: str,
     # the API answers; sending inside the block ends the indicator cleanly
     async with safe_typing(ctx.channel) if delay > 0 else contextlib.nullcontext():
         if delay > 0:
+            log.info("[#%s] Typing for %.1fs before sending.", ctx.channel_name, delay)
             await asyncio.sleep(delay)
         for index, chunk in enumerate(chunks):
             # Only the first chunk carries the reply reference

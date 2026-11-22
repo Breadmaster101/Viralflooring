@@ -46,11 +46,19 @@ def setup_logging(cfg: LoggingConfig, log_path) -> None:
 #  Typing indicator
 # ---------------------------------------------------------------------------
 
+# After /typing fails in a channel, leave that channel alone for this long, so
+# a channel that keeps refusing it (it can 429 indefinitely, notably under
+# slowmode) costs one short timeout every so often rather than one per reply.
+TYPING_RETRY_SECONDS = 600.0
+_typing_blocked_until: dict[int, float] = {}
+
+
 @contextlib.asynccontextmanager
 async def safe_typing(channel: discord.abc.Messageable):
-    # Shows typing, giving up quietly. /typing can 429 forever, so slowmode
-    # channels are skipped and the rest get a short timeout.
-    if getattr(channel, "slowmode_delay", 0):
+    # Shows typing, giving up quietly after a short timeout
+    name = getattr(channel, "name", "DM")
+    key = getattr(channel, "id", None)
+    if key is not None and _typing_blocked_until.get(key, 0.0) > time.monotonic():
         yield
         return
 
@@ -58,9 +66,16 @@ async def safe_typing(channel: discord.abc.Messageable):
     try:
         await asyncio.wait_for(typing_ctx.__aenter__(), timeout=1.5)
     except (discord.HTTPException, asyncio.TimeoutError) as e:
-        log.warning("Typing indicator unavailable, continuing without it: %s", e)
+        if key is not None:
+            _typing_blocked_until[key] = time.monotonic() + TYPING_RETRY_SECONDS
+        log.warning(
+            "[#%s] Typing indicator unavailable, continuing without it for the next "
+            "%.0f minutes%s: %r", name, TYPING_RETRY_SECONDS / 60,
+            " (slowmode is on here)" if getattr(channel, "slowmode_delay", 0) else "", e,
+        )
         yield
         return
+    log.debug("[#%s] Typing indicator on.", name)
 
     try:
         yield
