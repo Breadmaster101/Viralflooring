@@ -18,6 +18,14 @@ max_message_length = 2000
 # Intents). On here but off there and the bot will not start.
 member_intent = false
 
+# Fast chats. Before replying, wait until the channel has been quiet this many
+# seconds, so a burst of messages is answered in one API call instead of one
+# call each. Messages that arrive while a reply is being written are answered
+# together in a single follow-up turn either way. 0 replies straight away.
+batch_window_seconds = 2.0
+# ...but never hold a reply back longer than this while people keep talking.
+batch_max_wait_seconds = 8.0
+
 
 [discord.channel_whitelist]
 # Limit the bot to certain channels in a server: server ID = [channel IDs].
@@ -236,8 +244,9 @@ enabled = [
 # runaway loops.
 max_iterations = 4
 
-# Maximum messages the bot may send in response to one incoming message.
-max_replies_per_turn = 2
+# Maximum messages the bot may send in one turn. A turn can answer several
+# incoming messages at once in a fast chat, so leave room for more than one.
+max_replies_per_turn = 3
 
 # Caps on get_server_info, so a big server cannot flood the prompt.
 max_members_listed = 50

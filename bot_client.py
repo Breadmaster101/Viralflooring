@@ -7,6 +7,7 @@ import asyncio
 import logging
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 import discord
@@ -31,6 +32,17 @@ log = logging.getLogger(__name__)
 
 # Used when no persona file is configured; deliberately characterless
 DEFAULT_PERSONA = "You are a participant in a Discord chat."
+
+
+@dataclass
+class ChannelQueue:
+    # Messages in one channel that no turn has answered yet
+    pending: bool = False
+    mentioned: bool = False  # any of them @mentioned the bot
+    count: int = 0
+    first_at: float = 0.0  # monotonic time the oldest unanswered one arrived
+    last_at: float = 0.0   # and the newest
+    worker: asyncio.Task | None = None
 
 
 class ViralBot(discord.Client):
@@ -70,7 +82,7 @@ class ViralBot(discord.Client):
 
         self.tokenizer = self._load_tokenizer()
 
-        self._channel_locks: dict[int, asyncio.Lock] = {}
+        self._queues: dict[int, ChannelQueue] = {}
         self._turns: set[asyncio.Task] = set()
         self.last_troll_channel: discord.abc.Messageable | None = None
 
@@ -403,18 +415,62 @@ class ViralBot(discord.Client):
     #  Message intake
     # ------------------------------------------------------------------
 
-    def _lock_for(self, channel_id: int) -> asyncio.Lock:
-        return self._channel_locks.setdefault(channel_id, asyncio.Lock())
+    def _queue_turn(self, channel: discord.abc.Messageable, mentioned: bool) -> None:
+        # Note that a channel has something new and make sure a worker will
+        # answer it. The message is already stored, so however many arrive
+        # before the worker gets to them, one turn covers them all.
+        queue = self._queues.setdefault(channel.id, ChannelQueue())
+        now = time.monotonic()
+        if not queue.pending:
+            queue.first_at = now
+        queue.pending = True
+        queue.last_at = now
+        queue.count += 1
+        queue.mentioned = queue.mentioned or mentioned
+        if queue.worker is None or queue.worker.done():
+            queue.worker = asyncio.create_task(self._channel_worker(channel, queue))
+            # Keep a reference so the task is not garbage collected
+            self._turns.add(queue.worker)
+            queue.worker.add_done_callback(self._turns.discard)
 
-    async def _handle_message(self, message: discord.Message, content: str,
-                              author: str, show_typing: bool) -> None:
-        # Store the message and take a turn, one channel at a time
-        async with self._lock_for(message.channel.id):
-            await add_message(
-                self.db, message.channel.id, "user", content, self.count_tokens,
-                name=author, message_id=message.id, author_id=message.author.id,
+    async def _channel_worker(self, channel: discord.abc.Messageable,
+                              queue: ChannelQueue) -> None:
+        # Takes turns in one channel until nothing new has come in. Only one
+        # runs per channel, so turns there never overlap.
+        channel_name = getattr(channel, "name", "DM")
+        while queue.pending:
+            await self._wait_for_quiet(queue)
+            await self._wait_for_quota(channel_name)
+            # Cleared just before reading the chat: anything that arrives from
+            # here on is not in this turn, so it sets pending again for the next
+            if queue.count > 1:
+                log.info("[#%s] Answering %d new messages in one turn.",
+                         channel_name, queue.count)
+            show_typing = queue.mentioned
+            queue.pending, queue.mentioned, queue.count = False, False, 0
+            await self.run_turn(channel, show_typing=show_typing)
+
+    async def _wait_for_quiet(self, queue: ChannelQueue) -> None:
+        # Until the chat has paused for batch_window_seconds, or the first
+        # waiting message has been held for batch_max_wait_seconds
+        window = self.cfg.discord.batch_window_seconds
+        cap = self.cfg.discord.batch_max_wait_seconds
+        while True:
+            wait = min(queue.last_at + window, queue.first_at + cap) - time.monotonic()
+            if wait <= 0:
+                return
+            await asyncio.sleep(wait)
+
+    async def _wait_for_quota(self, channel_name: str) -> None:
+        # Wait out the rate limit before reading the chat rather than after, so
+        # whatever is said in the meantime makes it into this call
+        delay = self.llm.ready_in(self.llm.last_estimate)
+        if delay > 0:
+            log.info(
+                "[#%s] Waiting %.1fs for API quota before reading the chat.",
+                channel_name, delay,
             )
-            await self.run_turn(message.channel, show_typing=show_typing)
+            await asyncio.sleep(delay)
 
     async def on_message(self, message: discord.Message) -> None:
         if self.user is None or message.author.id == self.user.id:
@@ -433,23 +489,16 @@ class ViralBot(discord.Client):
         channel_name = getattr(message.channel, "name", "DM")
         log.info("[#%s] %s: %s", channel_name, author, content)
 
+        # Stored straight away, so a turn already waiting sees it
+        await add_message(
+            self.db, message.channel.id, "user", content, self.count_tokens,
+            name=author, message_id=message.id, author_id=message.author.id,
+        )
         if self.troll_mode:
             self.last_troll_channel = message.channel
-            await add_message(
-                self.db, message.channel.id, "user", content, self.count_tokens,
-                name=author, message_id=message.id, author_id=message.author.id,
-            )
             return
 
-        task = asyncio.create_task(
-            self._handle_message(
-                message, content, author,
-                show_typing=self.user.mentioned_in(message),
-            )
-        )
-        # Keep a reference so the task is not garbage collected
-        self._turns.add(task)
-        task.add_done_callback(self._turns.discard)
+        self._queue_turn(message.channel, self.user.mentioned_in(message))
 
     # ------------------------------------------------------------------
     #  Edits and reactions

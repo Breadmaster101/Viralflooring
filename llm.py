@@ -395,6 +395,16 @@ class LLMClient:
         # For when another model could take the call instead: SDK retries all hit
         # the same model, costing up to a timeout each before the chain moves on
         self.no_retry_client = self.client.with_options(max_retries=0)
+        # Size of the most recent request, used to ask about room for the next
+        self.last_estimate = 0
+
+    def ready_in(self, estimated: int) -> float:
+        # Seconds until some model in the chain has room for a call this size,
+        # so the caller can wait before building the request rather than after
+        usable = self.rotation.usable()
+        if not usable:
+            return self.rotation.soonest()[1]
+        return min(self.limiter.delay_for(m, estimated) for m in usable)
 
     async def aclose(self) -> None:
         await self.client.close()
@@ -482,6 +492,7 @@ class LLMClient:
             request["tool_choice"] = "auto"
 
         estimated = estimate_tokens([messages, tools or []])
+        self.last_estimate = estimated
 
         # Prefer a model with room now over the preferred one without it
         usable = self.rotation.usable()

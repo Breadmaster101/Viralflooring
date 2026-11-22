@@ -68,6 +68,10 @@ class DiscordConfig:
     allow_dms: bool = True
     max_message_length: int = 2000
     member_intent: bool = False
+    # Fast chats: wait for this much quiet (capped at the max) so a burst of
+    # messages is answered in one turn. 0 disables the wait.
+    batch_window_seconds: float = 2.0
+    batch_max_wait_seconds: float = 8.0
     # Server ID -> the only channel IDs the bot takes part in there. Servers
     # not listed are unrestricted.
     channel_whitelist: dict[int, frozenset[int]] = field(default_factory=dict)
@@ -294,6 +298,10 @@ def load_config(path: Path = CONFIG_FILE) -> Config:
         allow_dms=_get(discord_t, "discord", "allow_dms", True, bool),
         max_message_length=_get(discord_t, "discord", "max_message_length", 2000, int),
         member_intent=_get(discord_t, "discord", "member_intent", False, bool),
+        batch_window_seconds=_get(
+            discord_t, "discord", "batch_window_seconds", 2.0, float, positive=False),
+        batch_max_wait_seconds=_get(
+            discord_t, "discord", "batch_max_wait_seconds", 8.0, float, positive=False),
         channel_whitelist=_channel_whitelist(discord_t),
     )
 
