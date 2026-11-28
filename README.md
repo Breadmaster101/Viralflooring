@@ -286,8 +286,10 @@ extra rounds of bots answering each other one message can start; at `0`,
 subvirals only answer people. Each subviral costs one API call per message.
 
 All subvirals share [`prompt/subviral_fixed.txt`](prompt/subviral_fixed.txt),
-the rules for reading the chat and when to speak, with each one's own file
-dropped in where `{persona}` is.
+the machinery for calling their one tool and reading the chat, with each one's
+own file dropped in where `{persona}` is. As with the main bot, everything that
+shapes how one behaves (who it is, how long it talks, when it speaks, its
+ground rules) goes in its own persona file, not the shared one.
 
 ### Turn features on or off
 

@@ -272,9 +272,9 @@ max_channels_listed = 40
 # webhooks in DMs.
 enabled = false
 
-# The shared rules every subviral gets: how to read the chat and when to
-# speak. Its own persona_file is dropped in where {persona} is, and {name}
-# becomes its name.
+# The machinery every subviral shares: how its one tool works and how to read
+# the chat. Nothing about who it is or when it speaks; that belongs in its
+# persona_file, which is dropped in where {persona} is. {name} becomes its name.
 fixed_file = "prompt/subviral_fixed.txt"
 
 # Every subviral reads every message and decides for itself whether to speak,
@@ -295,7 +295,8 @@ cooldown_seconds = 2.0
 
 # One [[subvirals.bots]] block per subviral.
 #   name          shown as its username; may not contain "discord" or "clyde"
-#   persona_file  who it is and how it talks
+#   persona_file  who it is, how it talks, when it speaks, and what it will
+#                 not do
 #   avatar_url    image URL for its avatar, or "" for the webhook default
 #   backend       "local", "gemini" or "mistral", using that [llm.*] table's
 #                 settings and its API key, so it stays off Viral's quota.
