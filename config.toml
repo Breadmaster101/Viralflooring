@@ -286,10 +286,11 @@ fixed_file = "prompt/subviral_fixed.txt"
 # answer people, and Viral never answers a subviral.
 max_chain = 0
 
-# Rate limits for subvirals with their own backend (below). [llm]
-# input_tokens_per_minute is sized for gemini, which would throttle mistral
-# far below what it allows, so it gets its own number. 0 uses [llm]'s.
-input_tokens_per_minute = 120000
+# Rate limits for subvirals with their own backend or model (below). Ignored
+# by subvirals that share Viral's, which use [llm]'s. [llm]
+# input_tokens_per_minute is sized for gemini; another backend may allow far
+# more. 0 uses [llm]'s.
+input_tokens_per_minute = 0
 cooldown_seconds = 2.0
 
 # One [[subvirals.bots]] block per subviral.
@@ -308,7 +309,7 @@ cooldown_seconds = 2.0
 name = "Grimbald the Squire"
 persona_file = "prompt/subvirals/grimbald.txt"
 avatar_url = ""
-backend = "mistral"
+backend = ""
 model = ""
 
 
