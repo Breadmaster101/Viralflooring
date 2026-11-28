@@ -183,7 +183,9 @@ def _check_subvirals(cfg: Config) -> int:
 
     sub = cfg.subvirals
     if not sub.enabled:
-        print("Subvirals: off")
+        print("Subvirals: off" + (" (every one was left out)" if sub.skipped else ""))
+        for why in sub.skipped:
+            print(f"  {why}")
         return 0
 
     try:
@@ -212,6 +214,8 @@ def _check_subvirals(cfg: Config) -> int:
             continue
         cost = estimate_tokens([render_prompt(fixed, persona, bot.name), [REPLY_TOOL]])
         print(f"  {bot.name}: {llm}, ~{cost} input tokens per call before history")
+    for why in sub.skipped:
+        print(f"  {why}")
     return status
 
 

@@ -267,8 +267,9 @@ max_channels_listed = 40
 # separate person. They can only talk: no reactions, memory or other tools.
 # Viral is not told they exist and treats them as strangers.
 #
-# Needs the Manage Webhooks permission in every channel they talk in. Servers
-# only: Discord has no webhooks in DMs.
+# Needs the Manage Webhooks permission in every channel they talk in; without
+# it they stay quiet there and the log says why. Servers only: Discord has no
+# webhooks in DMs.
 enabled = false
 
 # The shared rules every subviral gets: how to read the chat and when to
@@ -297,6 +298,8 @@ cooldown_seconds = 2.0
 #   avatar_url    image URL for its avatar, or "" for the webhook default
 #   backend       "local", "gemini" or "mistral", using that [llm.*] table's
 #                 settings and its API key, so it stays off Viral's quota.
+#                 If that key is not set, this subviral is left out (with a
+#                 warning) and the bot runs without it.
 #                 "" shares Viral's backend, model and quota.
 #   model         overrides that backend's model (and drops its fallbacks),
 #                 or "" to use the table's model

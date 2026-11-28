@@ -169,6 +169,8 @@ class SubviralConfig:
 class SubviralsConfig:
     enabled: bool = False
     fixed_file: str = "prompt/subviral_fixed.txt"
+    # Why each subviral that was configured but left out is missing
+    skipped: tuple[str, ...] = ()
     # How many rounds of bots answering each other one human message can start.
     # 0: subvirals answer people, and Viral never answers a subviral.
     max_chain: int = 0
@@ -511,6 +513,7 @@ def _subvirals_config(data: dict[str, Any], llm_t: dict[str, Any],
         return SubviralsConfig(enabled=False, fixed_file=fixed_file, max_chain=max_chain)
 
     bots: list[SubviralConfig] = []
+    skipped: list[str] = []
     seen: set[str] = set()
     for index, bot_t in enumerate(raw_bots, 1):
         where = f"subvirals.bots #{index}"
@@ -540,6 +543,13 @@ def _subvirals_config(data: dict[str, Any], llm_t: dict[str, Any],
             )
         if not backend and not model:
             own = None  # Viral's client, quota and fallbacks
+        elif backend and not os.environ.get(BACKENDS[backend].env_key, "").strip():
+            # Not fatal: the bot runs without this one rather than not at all
+            skipped.append(
+                f"{name}: left out, because its backend is {backend!r} and "
+                f"{BACKENDS[backend].env_key} is not set in .env"
+            )
+            continue
         else:
             own = _llm_config(
                 llm_t, backend or main_llm.backend, model,
@@ -554,11 +564,12 @@ def _subvirals_config(data: dict[str, Any], llm_t: dict[str, Any],
             llm=own,
         ))
 
-    if not bots:
+    if not raw_bots:
         raise ConfigError(
             "[subvirals] enabled is true but no [[subvirals.bots]] are defined. "
             "Add one, or set enabled = false."
         )
     return SubviralsConfig(
-        enabled=True, fixed_file=fixed_file, max_chain=max_chain, bots=tuple(bots),
+        enabled=bool(bots), fixed_file=fixed_file, max_chain=max_chain,
+        bots=tuple(bots), skipped=tuple(skipped),
     )

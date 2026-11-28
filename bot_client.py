@@ -84,6 +84,8 @@ class ViralBot(discord.Client):
 
         # Extra characters speaking through webhooks; see subviral.py
         self.subvirals = None
+        for why in cfg.subvirals.skipped:
+            log.warning("Subviral %s", why)
         if cfg.subvirals.enabled:
             from subviral import Subvirals
             try:

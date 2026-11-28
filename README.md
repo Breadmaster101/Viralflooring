@@ -265,16 +265,18 @@ tools. The main bot isn't told they exist and treats them as strangers.
 The default subviral is **Grimbald the Squire** (he goes by Phip), a medieval
 squire with a gout-ridden master and a deep hatred of Lent, in
 [`prompt/subvirals/grimbald.txt`](prompt/subvirals/grimbald.txt). To turn
-subvirals on:
+subvirals are off by default. To turn them on:
 
-1. Give the bot the **Manage Webhooks** permission in the channels they should
-   talk in. They only work in servers, since DMs have no webhooks.
-2. Set `enabled = true` under `[subvirals]` in `config.toml`.
-3. Each `[[subvirals.bots]]` block is one subviral: a `name`, a `persona_file`,
-   an optional `avatar_url`, and optionally its own `backend` and `model`.
-   Grimbald uses `backend = "mistral"` so he doesn't eat the main bot's Gemini
-   quota, which needs `MISTRAL_API_KEY` in `.env`. Set `backend = ""` to share
-   the main bot's backend instead.
+1. Set `enabled = true` under `[subvirals]` in `config.toml`.
+2. Give the bot the **Manage Webhooks** permission in the channels he should
+   talk in. He only works in servers, since DMs have no webhooks.
+3. Set `MISTRAL_API_KEY` in `.env`. Grimbald uses `backend = "mistral"` so he
+   doesn't eat the main bot's Gemini quota. Without the key he is left out with
+   a warning and the bot runs without him. Set `backend = ""` to share the main
+   bot's backend instead.
+
+Each `[[subvirals.bots]]` block is one subviral: a `name`, a `persona_file`, an
+optional `avatar_url`, and optionally its own `backend` and `model`.
 
 Every subviral reads every message and decides for itself whether to speak,
 one at a time after the main bot's turn. `max_chain` (default `0`) is how many
