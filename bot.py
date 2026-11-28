@@ -174,7 +174,45 @@ def check_config(cfg: Config) -> int:
         )
     else:
         print(f"Persona self-editing: on (scope: {cfg.persona.scope})")
-    return 0
+    return _check_subvirals(cfg)
+
+
+def _check_subvirals(cfg: Config) -> int:
+    from llm import estimate_tokens
+    from subviral import REPLY_TOOL, render_prompt
+
+    sub = cfg.subvirals
+    if not sub.enabled:
+        print("Subvirals: off")
+        return 0
+
+    try:
+        fixed = cfg.path(sub.fixed_file).read_text(encoding="utf-8")
+    except OSError as e:
+        print(f"Subvirals: {cfg.path(sub.fixed_file)} could not be read ({e.strerror or e})")
+        return 1
+    chain = (
+        "they only answer people" if sub.max_chain == 0
+        else f"up to {sub.max_chain} extra round(s) of bots answering each other"
+    )
+    print(f"Subvirals: on, {len(sub.bots)} of them, {chain} (needs Manage Webhooks)")
+
+    status = 0
+    for bot in sub.bots:
+        llm = (
+            f"{bot.llm.backend} {bot.llm.model}" if bot.llm
+            else f"Viral's backend and quota ({cfg.llm.backend} {cfg.llm.model})"
+        )
+        try:
+            persona = cfg.path(bot.persona_file).read_text(encoding="utf-8")
+        except OSError as e:
+            print(f"  {bot.name}: {cfg.path(bot.persona_file)} could not be read "
+                  f"({e.strerror or e})")
+            status = 1
+            continue
+        cost = estimate_tokens([render_prompt(fixed, persona, bot.name), [REPLY_TOOL]])
+        print(f"  {bot.name}: {llm}, ~{cost} input tokens per call before history")
+    return status
 
 
 def reset_persona(cfg: Config) -> int:

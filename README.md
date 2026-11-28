@@ -37,6 +37,7 @@ model provider. Setup takes about 10 minutes.
    - Read Message History
    - Add Reactions
    - Change Nickname
+   - Manage Webhooks (only needed for [subvirals](#add-subvirals))
 5. Open the generated URL at the bottom, pick your server, and authorize.
 
 > The bot talks in **every channel it can see**. To keep it to certain
@@ -254,6 +255,36 @@ also set `base_url` (default `http://127.0.0.1:8080/v1`).
 If you switch to **Mistral**, raise `input_tokens_per_minute` to `120000`. The
 default is tuned for Gemini's tighter free tier.
 
+### Add subvirals
+
+Subvirals are extra characters that talk alongside the bot. Each one speaks
+through a channel webhook under its own name and avatar, so it looks like a
+separate person in the chat. They can only talk: no reactions, memory or other
+tools. The main bot isn't told they exist and treats them as strangers.
+
+The default subviral is **Grimbald the Squire** (he goes by Phip), a medieval
+squire with a gout-ridden master and a deep hatred of Lent, in
+[`prompt/subvirals/grimbald.txt`](prompt/subvirals/grimbald.txt). To turn
+subvirals on:
+
+1. Give the bot the **Manage Webhooks** permission in the channels they should
+   talk in. They only work in servers, since DMs have no webhooks.
+2. Set `enabled = true` under `[subvirals]` in `config.toml`.
+3. Each `[[subvirals.bots]]` block is one subviral: a `name`, a `persona_file`,
+   an optional `avatar_url`, and optionally its own `backend` and `model`.
+   Grimbald uses `backend = "mistral"` so he doesn't eat the main bot's Gemini
+   quota, which needs `MISTRAL_API_KEY` in `.env`. Set `backend = ""` to share
+   the main bot's backend instead.
+
+Every subviral reads every message and decides for itself whether to speak,
+one at a time after the main bot's turn. `max_chain` (default `0`) is how many
+extra rounds of bots answering each other one message can start; at `0`,
+subvirals only answer people. Each subviral costs one API call per message.
+
+All subvirals share [`prompt/subviral_fixed.txt`](prompt/subviral_fixed.txt),
+the rules for reading the chat and when to speak, with each one's own file
+dropped in where `{persona}` is.
+
 ### Turn features on or off
 
 Everything is in [`config.toml`](config.toml), and every setting has a comment
@@ -469,10 +500,12 @@ database.py      SQLite conversation history and reactions
 memory.py        long-term memory store
 user_memory.py   long-term memory filed under a person
 persona.py       system prompt: the fixed half and the editable half
+subviral.py      subvirals: webhook characters and their turns
 utils.py         logging, message splitting, history formatting
 console.py       cross-platform raw keyboard input
 troll.py         troll mode worker
-prompt/          fixed.txt (bot cannot change) and persona.txt (it can)
+prompt/          fixed.txt (bot cannot change) and persona.txt (it can),
+                 plus subviral_fixed.txt and subvirals/ for the subvirals
 ```
 
 ### Privacy

@@ -156,6 +156,26 @@ class ToolsConfig:
 
 
 @dataclass(frozen=True)
+class SubviralConfig:
+    # One extra character that speaks through a channel webhook
+    name: str
+    persona_file: str
+    avatar_url: str = ""
+    # Its own backend and model; None shares Viral's [llm] client and quota
+    llm: LLMConfig | None = None
+
+
+@dataclass(frozen=True)
+class SubviralsConfig:
+    enabled: bool = False
+    fixed_file: str = "prompt/subviral_fixed.txt"
+    # How many rounds of bots answering each other one human message can start.
+    # 0: subvirals answer people, and Viral never answers a subviral.
+    max_chain: int = 0
+    bots: tuple[SubviralConfig, ...] = ()
+
+
+@dataclass(frozen=True)
 class LoggingConfig:
     level: str = "INFO"
     file: str = "bot.log"
@@ -172,6 +192,7 @@ class Config:
     memory: MemoryConfig
     tools: ToolsConfig
     logging: LoggingConfig
+    subvirals: SubviralsConfig = field(default_factory=SubviralsConfig)
     root: Path = ROOT
 
     def path(self, relative: str) -> Path:
@@ -319,49 +340,7 @@ def load_config(path: Path = CONFIG_FILE) -> Config:
     # --- llm ---
     llm_t = _table(data, "llm")
     backend_name = _get(llm_t, "llm", "backend", "gemini", str, tuple(BACKENDS))
-    backend = BACKENDS[backend_name]
-    backend_t = _table(llm_t, backend_name)
-    section = f"llm.{backend_name}"
-
-    base_url = _get(backend_t, section, "base_url", backend.base_url, str)
-    if not base_url:
-        raise ConfigError(f"[{section}] base_url is required for the '{backend_name}' backend.")
-
-    model = _get(backend_t, section, "model", backend.default_model, str).strip()
-    if not model:
-        raise ConfigError(f"[{section}] model cannot be empty.")
-
-    # Drop duplicates, and the primary, from the fallbacks
-    raw_fallbacks = backend_t.get("fallback_models", list(backend.fallbacks))
-    if not isinstance(raw_fallbacks, list) or not all(
-        isinstance(m, str) and m.strip() for m in raw_fallbacks
-    ):
-        raise ConfigError(
-            f"[{section}] fallback_models must be a list of model names, "
-            'e.g. ["gemini-3.5-flash-lite", "gemma-4-26b-a4b-it"], use [] for none.'
-        )
-    fallbacks: list[str] = []
-    for name in raw_fallbacks:
-        name = name.strip()
-        if name != model and name not in fallbacks:
-            fallbacks.append(name)
-
-    llm_cfg = LLMConfig(
-        backend=backend_name,
-        model=model,
-        base_url=base_url,
-        api_key=_require_secret(backend.env_key, f"The API key for the '{backend_name}' backend"),
-        max_output_tokens=_get(llm_t, "llm", "max_output_tokens", 1000, int),
-        timeout_seconds=_get(llm_t, "llm", "timeout_seconds", 30.0, float),
-        cooldown_seconds=_get(llm_t, "llm", "cooldown_seconds", 1.0, float, positive=False),
-        max_retries=_get(llm_t, "llm", "max_retries", 3, int, positive=False),
-        reasoning_effort=_get(llm_t, "llm", "reasoning_effort", "auto", str, REASONING_LEVELS),
-        input_tokens_per_minute=_get(
-            llm_t, "llm", "input_tokens_per_minute", 0, int, positive=False),
-        fallback_models=tuple(fallbacks),
-        fallback_cooldown_seconds=_get(
-            llm_t, "llm", "fallback_cooldown_seconds", 60.0, float),
-    )
+    llm_cfg = _llm_config(llm_t, backend_name)
 
     # --- persona ---
     persona_t = _table(data, "persona")
@@ -446,4 +425,140 @@ def load_config(path: Path = CONFIG_FILE) -> Config:
         memory=memory_cfg,
         tools=tools_cfg,
         logging=log_cfg,
+        subvirals=_subvirals_config(data, llm_t, llm_cfg),
+    )
+
+
+def _llm_config(llm_t: dict[str, Any], backend_name: str, model: str = "",
+                tokens_per_minute: int | None = None,
+                cooldown: float | None = None) -> LLMConfig:
+    # One backend's settings: its [llm.<backend>] table plus the shared [llm] keys.
+    # A model given here replaces the table's model and drops its fallbacks.
+    backend = BACKENDS[backend_name]
+    backend_t = _table(llm_t, backend_name, f"llm.{backend_name}")
+    section = f"llm.{backend_name}"
+
+    base_url = _get(backend_t, section, "base_url", backend.base_url, str)
+    if not base_url:
+        raise ConfigError(f"[{section}] base_url is required for the '{backend_name}' backend.")
+
+    if model:
+        fallbacks: list[str] = []
+    else:
+        model = _get(backend_t, section, "model", backend.default_model, str).strip()
+        if not model:
+            raise ConfigError(f"[{section}] model cannot be empty.")
+
+        # Drop duplicates, and the primary, from the fallbacks
+        raw_fallbacks = backend_t.get("fallback_models", list(backend.fallbacks))
+        if not isinstance(raw_fallbacks, list) or not all(
+            isinstance(m, str) and m.strip() for m in raw_fallbacks
+        ):
+            raise ConfigError(
+                f"[{section}] fallback_models must be a list of model names, "
+                'e.g. ["gemini-3.5-flash-lite", "gemma-4-26b-a4b-it"], use [] for none.'
+            )
+        fallbacks = []
+        for name in raw_fallbacks:
+            name = name.strip()
+            if name != model and name not in fallbacks:
+                fallbacks.append(name)
+
+    if tokens_per_minute is None:
+        tokens_per_minute = _get(
+            llm_t, "llm", "input_tokens_per_minute", 0, int, positive=False)
+    if cooldown is None:
+        cooldown = _get(llm_t, "llm", "cooldown_seconds", 1.0, float, positive=False)
+
+    return LLMConfig(
+        backend=backend_name,
+        model=model,
+        base_url=base_url,
+        api_key=_require_secret(backend.env_key, f"The API key for the '{backend_name}' backend"),
+        max_output_tokens=_get(llm_t, "llm", "max_output_tokens", 1000, int),
+        timeout_seconds=_get(llm_t, "llm", "timeout_seconds", 30.0, float),
+        cooldown_seconds=cooldown,
+        max_retries=_get(llm_t, "llm", "max_retries", 3, int, positive=False),
+        reasoning_effort=_get(llm_t, "llm", "reasoning_effort", "auto", str, REASONING_LEVELS),
+        input_tokens_per_minute=tokens_per_minute,
+        fallback_models=tuple(fallbacks),
+        fallback_cooldown_seconds=_get(
+            llm_t, "llm", "fallback_cooldown_seconds", 60.0, float),
+    )
+
+
+# Discord refuses webhook usernames containing these
+WEBHOOK_BANNED_NAMES = ("discord", "clyde")
+
+
+def _subvirals_config(data: dict[str, Any], llm_t: dict[str, Any],
+                      main_llm: LLMConfig) -> SubviralsConfig:
+    sub_t = _table(data, "subvirals")
+    enabled = _get(sub_t, "subvirals", "enabled", False, bool)
+    fixed_file = _get(sub_t, "subvirals", "fixed_file", "prompt/subviral_fixed.txt", str)
+    max_chain = _get(sub_t, "subvirals", "max_chain", 0, int, positive=False)
+    if max_chain < 0:
+        raise ConfigError(f"[subvirals] max_chain cannot be negative, got {max_chain}")
+    # Limits for the subvirals' own clients; 0 / unset fall back to [llm]
+    tpm = _get(sub_t, "subvirals", "input_tokens_per_minute", 0, int, positive=False)
+    cooldown = _get(sub_t, "subvirals", "cooldown_seconds", -1.0, float, positive=False)
+
+    raw_bots = sub_t.get("bots", [])
+    if not isinstance(raw_bots, list) or not all(isinstance(b, dict) for b in raw_bots):
+        raise ConfigError("[[subvirals.bots]] must be a list of tables, one per subviral.")
+    if not enabled:
+        # Nothing below is used, so a missing API key must not stop the bot
+        return SubviralsConfig(enabled=False, fixed_file=fixed_file, max_chain=max_chain)
+
+    bots: list[SubviralConfig] = []
+    seen: set[str] = set()
+    for index, bot_t in enumerate(raw_bots, 1):
+        where = f"subvirals.bots #{index}"
+        name = _get(bot_t, where, "name", "", str).strip()
+        if not name or len(name) > 80:
+            raise ConfigError(f"[{where}] name must be 1-80 characters, got {name!r}")
+        banned = next((b for b in WEBHOOK_BANNED_NAMES if b in name.lower()), None)
+        if banned:
+            raise ConfigError(
+                f"[{where}] name {name!r} contains {banned!r}, which Discord does "
+                f"not allow in a webhook's name."
+            )
+        if name.lower() in seen:
+            raise ConfigError(f"[{where}] name {name!r} is used by another subviral.")
+        seen.add(name.lower())
+
+        persona_file = _get(bot_t, where, "persona_file", "", str).strip()
+        if not persona_file:
+            raise ConfigError(f"[{where}] persona_file is required.")
+
+        backend = _get(bot_t, where, "backend", "", str).strip()
+        model = _get(bot_t, where, "model", "", str).strip()
+        if backend and backend not in BACKENDS:
+            raise ConfigError(
+                f"[{where}] backend must be one of: {', '.join(BACKENDS)}, "
+                f'or "" for Viral\'s, got {backend!r}'
+            )
+        if not backend and not model:
+            own = None  # Viral's client, quota and fallbacks
+        else:
+            own = _llm_config(
+                llm_t, backend or main_llm.backend, model,
+                tokens_per_minute=tpm or None,
+                cooldown=cooldown if cooldown >= 0 else None,
+            )
+
+        bots.append(SubviralConfig(
+            name=name,
+            persona_file=persona_file,
+            avatar_url=_get(bot_t, where, "avatar_url", "", str).strip(),
+            llm=own,
+        ))
+
+    if not bots:
+        raise ConfigError(
+            "[subvirals] enabled is true but no [[subvirals.bots]] are defined. "
+            "Add one, or set enabled = false."
+        )
+    return SubviralsConfig(
+        enabled=True, fixed_file=fixed_file, max_chain=max_chain, bots=tuple(bots),
     )

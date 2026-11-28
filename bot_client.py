@@ -82,6 +82,15 @@ class ViralBot(discord.Client):
 
         self.tokenizer = self._load_tokenizer()
 
+        # Extra characters speaking through webhooks; see subviral.py
+        self.subvirals = None
+        if cfg.subvirals.enabled:
+            from subviral import Subvirals
+            try:
+                self.subvirals = Subvirals(self, cfg)
+            except OSError as e:
+                log.error("Subvirals are off: a prompt file could not be read (%s).", e)
+
         self._queues: dict[int, ChannelQueue] = {}
         self._turns: set[asyncio.Task] = set()
         self.last_troll_channel: discord.abc.Messageable | None = None
@@ -184,6 +193,8 @@ class ViralBot(discord.Client):
         if self.db is not None:
             await self.db.close()
         await self.llm.aclose()
+        if self.subvirals is not None:
+            await self.subvirals.aclose()
         await super().close()
 
     async def on_ready(self) -> None:
@@ -452,6 +463,22 @@ class ViralBot(discord.Client):
             show_typing = queue.mentioned
             queue.pending, queue.mentioned, queue.count = False, False, 0
             await self.run_turn(channel, show_typing=show_typing)
+            await self._subviral_rounds(channel, queue)
+
+    async def _subviral_rounds(self, channel: discord.abc.Messageable,
+                               queue: ChannelQueue) -> None:
+        # After Viral's turn, each subviral gets one. If any of them spoke, Viral
+        # and the subvirals may answer that, up to [subvirals] max_chain more
+        # rounds. Someone new talking ends the chain, so their message is next.
+        if self.subvirals is None:
+            return
+        chain = 0
+        while await self.subvirals.round(channel):
+            if chain >= self.cfg.subvirals.max_chain or queue.pending:
+                return
+            chain += 1
+            await self._wait_for_quota(getattr(channel, "name", "DM"))
+            await self.run_turn(channel)
 
     async def _wait_for_quiet(self, queue: ChannelQueue) -> None:
         # Until the chat has paused for batch_window_seconds, or the first
@@ -477,6 +504,10 @@ class ViralBot(discord.Client):
 
     async def on_message(self, message: discord.Message) -> None:
         if self.user is None or message.author.id == self.user.id:
+            return
+        # A subviral's message, already stored when it was sent
+        if (self.subvirals is not None and message.webhook_id is not None
+                and message.webhook_id in self.subvirals.webhook_ids):
             return
         if self.cfg.discord.ignore_bots and message.author.bot:
             return

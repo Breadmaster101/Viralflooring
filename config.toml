@@ -261,6 +261,54 @@ max_members_listed = 50
 max_channels_listed = 40
 
 
+[subvirals]
+# Extra characters that talk in the chat alongside Viral. Each one speaks
+# through a channel webhook under its own name and avatar, so it looks like a
+# separate person. They can only talk: no reactions, memory or other tools.
+# Viral is not told they exist and treats them as strangers.
+#
+# Needs the Manage Webhooks permission in every channel they talk in. Servers
+# only: Discord has no webhooks in DMs.
+enabled = false
+
+# The shared rules every subviral gets: how to read the chat and when to
+# speak. Its own persona_file is dropped in where {persona} is, and {name}
+# becomes its name.
+fixed_file = "prompt/subviral_fixed.txt"
+
+# Every subviral reads every message and decides for itself whether to speak,
+# one after another after Viral's turn, each seeing what was said before it.
+# Each costs one API call per message, on its own backend if it has one.
+#
+# max_chain is how many extra rounds that can start: in each, Viral and the
+# subvirals answer whatever a subviral just said. 0 means subvirals only ever
+# answer people, and Viral never answers a subviral.
+max_chain = 0
+
+# Rate limits for subvirals with their own backend (below). [llm]
+# input_tokens_per_minute is sized for gemini, which would throttle mistral
+# far below what it allows, so it gets its own number. 0 uses [llm]'s.
+input_tokens_per_minute = 120000
+cooldown_seconds = 2.0
+
+# One [[subvirals.bots]] block per subviral.
+#   name          shown as its username; may not contain "discord" or "clyde"
+#   persona_file  who it is and how it talks
+#   avatar_url    image URL for its avatar, or "" for the webhook default
+#   backend       "local", "gemini" or "mistral", using that [llm.*] table's
+#                 settings and its API key, so it stays off Viral's quota.
+#                 "" shares Viral's backend, model and quota.
+#   model         overrides that backend's model (and drops its fallbacks),
+#                 or "" to use the table's model
+
+[[subvirals.bots]]
+name = "Grimbald the Squire"
+persona_file = "prompt/subvirals/grimbald.txt"
+avatar_url = ""
+backend = "mistral"
+model = ""
+
+
 [logging]
 # "DEBUG", "INFO", "WARNING", "ERROR"
 level = "INFO"

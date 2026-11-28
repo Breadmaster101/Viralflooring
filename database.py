@@ -21,7 +21,9 @@ CREATE TABLE IF NOT EXISTS history (
     content     TEXT    NOT NULL,
     tokens      INTEGER NOT NULL DEFAULT 0,
     edited      INTEGER NOT NULL DEFAULT 0,
-    timestamp   REAL    NOT NULL
+    timestamp   REAL    NOT NULL,
+    -- Which subviral sent it; NULL for people and for Viral itself
+    speaker     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_channel_time ON history (channel_id, timestamp DESC);
 
@@ -43,6 +45,7 @@ ADDED_COLUMNS = {
     "message_id": "INTEGER",
     "author_id": "INTEGER",
     "edited": "INTEGER NOT NULL DEFAULT 0",
+    "speaker": "TEXT",
 }
 
 
@@ -75,15 +78,16 @@ async def add_message(
     name: str | None = None,
     message_id: int | None = None,
     author_id: int | None = None,
+    speaker: str | None = None,
 ) -> None:
     # Insert one message into the history table
     try:
         await db.execute(
             "INSERT INTO history "
-            "(channel_id, message_id, author_id, role, name, content, tokens, timestamp) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "(channel_id, message_id, author_id, role, name, content, tokens, timestamp, "
+            "speaker) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (channel_id, message_id, author_id, role, name, content,
-             count_tokens(content), time.time()),
+             count_tokens(content), time.time(), speaker),
         )
         await db.commit()
     except Exception:
@@ -191,7 +195,7 @@ async def get_context(
     try:
         query = """
             WITH recent AS (
-                SELECT message_id, author_id, role, name, content, tokens, edited, timestamp
+                SELECT message_id, author_id, role, name, content, tokens, edited, timestamp, speaker
                 FROM history
                 WHERE channel_id = ?
                 ORDER BY timestamp DESC
@@ -201,7 +205,7 @@ async def get_context(
                 SELECT *, SUM(tokens) OVER (ORDER BY timestamp DESC) AS cumulative
                 FROM recent
             )
-            SELECT message_id, author_id, role, name, content, edited, timestamp
+            SELECT message_id, author_id, role, name, content, edited, timestamp, speaker
             FROM running
             WHERE cumulative <= ?
             ORDER BY timestamp ASC
@@ -211,8 +215,8 @@ async def get_context(
 
         if len(rows) < min_messages:
             fallback = """
-                SELECT message_id, author_id, role, name, content, edited, timestamp FROM (
-                    SELECT message_id, author_id, role, name, content, edited, timestamp
+                SELECT message_id, author_id, role, name, content, edited, timestamp, speaker FROM (
+                    SELECT message_id, author_id, role, name, content, edited, timestamp, speaker
                     FROM history
                     WHERE channel_id = ?
                     ORDER BY timestamp DESC
